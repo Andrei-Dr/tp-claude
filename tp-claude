@@ -1,0 +1,1061 @@
+#!/usr/bin/env python3
+"""
+tp-claude — "teleport" a project's code AND its Claude Code session/memory data
+to (or from) another machine (or another path on this one), so you can resume
+your conversations on the other side.
+
+Usage:
+    tp-claude <SRC> <DEST> [--dry-run] [--delete] [--full] [-v]
+
+SRC and DEST are handed to rsync VERBATIM — they mean exactly what they mean to
+rsync, including the trailing-slash rule:
+    tp-claude ~/dev/foo   host:/home/me/dev/      -> creates .../dev/foo
+    tp-claude ~/dev/foo/  host:/home/me/dev/foo/  -> mirrors foo's contents
+    tp-claude ~/dev/      host:/home/me/dev/      -> mirrors ~/dev's contents
+
+At most one side may be remote (user@host:/path). local->local is allowed
+(e.g. relocating a project); remote->remote is not.
+
+How it works:
+    1. rsync SRC -> DEST verbatim (the code).
+    2. Work out where rsync actually lands the files (applying rsync's own
+       trailing-slash rule) — used ONLY to locate the Claude project dirs.
+       Claude Code keeps a project's sessions in
+           <config>/projects/<encoded path>
+       where <config> is $CLAUDE_CONFIG_DIR or ~/.claude, resolved separately
+       on each machine, and the encoding is the one in encode_path() below.
+    3. rsync that project dir across (sessions, subagents, tool-results, memory).
+    4. On the destination, rewrite the absolute paths embedded in the session
+       files (cwd, index entries, tool results, the encoded dir name) so the
+       teleported conversations resolve on the destination.
+    5. Leave a .tp-claude.run manifest on the destination recording, per file,
+       the source fingerprint copied from and the destination fingerprint
+       produced. Step 4 necessarily makes the two sides differ, so without this
+       rsync would resend and rewrite every session file on every run. A file
+       is skipped only while both fingerprints still hold, which keeps edits on
+       either side from being missed. --full ignores it; --delete implies it.
+
+Requires rsync + python3 on both ends, and ssh key auth to any remote side.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import hashlib
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import tempfile
+import unicodedata
+from dataclasses import dataclass, field
+
+
+def die(msg: str) -> "None":
+    print(f"tp-claude: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+# Claude Code's own encoding, transcribed from the shipped binaries:
+#
+#     const MAX = 200
+#     function encode(p) {
+#       let s = p.replace(/[^a-zA-Z0-9]/g, "-")
+#       if (s.length <= MAX) return s
+#       return s.slice(0, MAX) + "-" + <hash>(p)
+#     }
+#
+# The input is NFC-normalized first, which matters on macOS: the filesystem
+# returns decomposed names, so "é" arrives as "e" + a combining accent and would
+# otherwise encode to "e-" rather than "-".
+#
+# Reading 2.1.90 through 2.1.221 (see docs in README), everything about this is
+# stable across releases -- the 200 limit, the character rule, NFC, and
+# resolving the config dir as CLAUDE_CONFIG_DIR ?? ~/.claude -- except <hash>,
+# which changed exactly once:
+#
+#     <= 2.1.100   Bun.hash(p).toString(36)
+#     >= 2.1.101   Math.abs(h)(p).toString(36), h = (h*31 + charCode)|0
+#
+# It only shows up for paths whose encoded form exceeds 200 characters, so most
+# transfers never touch it, but picking the wrong one silently points at a
+# directory Claude will never read.
+ENCODE_MAX = 200
+HASH_CHANGED_IN = (2, 1, 101)
+
+
+def encode_path(abs_path: str, long_hash=None) -> str:
+    path = unicodedata.normalize("NFC", abs_path)
+    encoded = re.sub(r"[^A-Za-z0-9]", "-", path)
+    if len(encoded) <= ENCODE_MAX:
+        return encoded                    # identical on every known release
+    if long_hash is None:
+        long_hash = js31_hash36
+    return f"{encoded[:ENCODE_MAX]}-{long_hash(path)}"
+
+
+def js31_hash36(text: str) -> str:
+    """Math.abs(h).toString(36) for h = (h * 31 + charCode) | 0, as used by
+    Claude Code from 2.1.101 onwards.
+
+    charCodeAt walks UTF-16 code units, so surrogate pairs have to be fed in
+    the same way rather than as Python code points.
+    """
+    value = 0
+    units = text.encode("utf-16-le")
+    for index in range(0, len(units), 2):
+        code = units[index] | (units[index + 1] << 8)
+        value = _int32((_int32(value << 5) - value) + code)
+    return _base36(abs(value))
+
+
+def _int32(value: int) -> int:
+    value &= 0xFFFFFFFF
+    return value - 0x100000000 if value >= 0x80000000 else value
+
+
+def _base36(number: int) -> str:
+    if number == 0:
+        return "0"
+    digits = "0123456789abcdefghijklmnopqrstuvwxyz"
+    out = ""
+    while number:
+        number, remainder = divmod(number, 36)
+        out = digits[remainder] + out
+    return out
+
+
+def bun_hash36(text: str) -> str:
+    """Base-36 Bun.hash(text), as used by Claude Code up to 2.1.100.
+
+    Shelled out to `bun` rather than reimplemented: it is wyhash with Bun's own
+    seeding, and a subtly wrong reimplementation would point at the wrong
+    directory without ever failing loudly.
+    """
+    try:
+        cp = subprocess.run(
+            ["bun", "-e", "console.log(Bun.hash(process.argv[1]).toString(36))",
+             text],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, check=True)
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        die(f"this path needs the Bun.hash suffix that Claude Code <= 2.1.100 "
+            f"uses, and `bun` is not available to compute it:\n  {text}")
+    return cp.stdout.strip()
+
+
+def _local_command(command: str) -> str:
+    try:
+        cp = subprocess.run(["bash", "-lc", command], stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL, text=True)
+        return cp.stdout
+    except OSError:
+        return ""
+
+
+SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
+
+# Bookkeeping left on the destination so a later run can tell what is already
+# in place. Rewriting paths necessarily makes the destination copies differ
+# from their sources, so rsync alone would resend every session file forever.
+MANIFEST_NAME = ".tp-claude.run"
+MANIFEST_VERSION = 2
+
+# Remote shells emit login banners and profile chatter, so values we care about
+# come back wrapped in a marker rather than trusted to be the whole of stdout.
+TAGGED = re.compile(r"tp<(.*?)>tp", re.S)
+
+# Sessions are not the only thing keyed by absolute path. ~/.claude.json holds a
+# `projects` map whose entries carry the trust decision, granted tool
+# permissions, per-project MCP servers and ignore patterns; ~/.claude/
+# history.jsonl tags each recalled prompt with the project it was typed in.
+# Without these the code and transcripts arrive but the project behaves like it
+# has never been opened -- trust dialog again, permissions re-prompted.
+#
+# Per-run measurements are deliberately left behind: they describe the machine
+# that produced them, not the project. Anything else is carried over, so
+# settings added by future releases travel without needing this list updated.
+VOLATILE_SETTINGS = {"exampleFiles", "exampleFilesGeneratedAt",
+                     "reactVulnerabilityCache"}
+DURABLE_LAST_KEYS = {"lastSessionId"}
+
+
+def durable_settings(entry: dict) -> dict:
+    return {
+        key: value for key, value in entry.items()
+        if key not in VOLATILE_SETTINGS
+        and (not key.startswith("last") or key in DURABLE_LAST_KEYS)
+    }
+
+
+def apply_subs(text: str, subs) -> str:
+    """Rewrite paths in `text`, matching the rule the session rewriter uses:
+    only at a path boundary, so '/a/app' never mangles '/a/app2'."""
+    for old, new in subs:
+        text = re.sub(re.escape(old) + r"(?![A-Za-z0-9._-])",
+                      lambda _m, replacement=new: replacement, text)
+    return text
+
+
+# Helper programs run on whichever machine owns the files. Kept as templates
+# rather than nested f-strings so the quoting stays readable.
+
+# Claude Code keeps the snapshots behind /rewind in
+# <config>/file-history/<session id>/<sha256(absolute file path)[:16]>@v<n>.
+# The session ids travel with the transcripts, but the entry names are derived
+# from the source machine's paths, so copying them unchanged would orphan every
+# one. Knowing the rule, they can simply be re-keyed to the new paths instead.
+HISTORY_PLAN = """
+import hashlib, json, os
+
+SRC_DIR = %(src_dir)s
+DEST_DIR = %(dest_dir)s
+ROOT = os.path.join(%(config)s, "file-history")
+
+
+def key(path):
+    return hashlib.sha256(path.encode()).hexdigest()[:16]
+
+
+# Every file still present in the project, by the name its snapshots carry.
+rename = {}
+for dirpath, dirnames, filenames in os.walk(SRC_DIR):
+    dirnames[:] = [d for d in dirnames if d not in (".git", "node_modules")]
+    for name in filenames:
+        full = os.path.join(dirpath, name)
+        rename[key(full)] = key(DEST_DIR + full[len(SRC_DIR):])
+
+plan = []
+for session in %(sessions)s:
+    folder = os.path.join(ROOT, session)
+    try:
+        entries = os.listdir(folder)
+    except OSError:
+        continue
+    for entry in entries:
+        stem, sep, version = entry.partition("@")
+        target = rename.get(stem)
+        if not target:
+            continue          # file since deleted or renamed: nothing to re-key
+        plan.append(["file-history/%%s/%%s" %% (session, entry),
+                     "file-history/%%s/%%s" %% (session, target + sep + version)])
+print("tp<" + json.dumps(plan) + ">tp")
+"""
+
+HISTORY_RENAME = """
+import base64, json, os, shutil
+ROOT = %(config)s
+plan = json.loads(base64.b64decode(%(plan)s).decode())
+KEEP_ORIGINAL = %(keep)s        # source and destination share this directory
+moved = 0
+for old, new in plan:
+    source = os.path.join(ROOT, old)
+    target = os.path.join(ROOT, new)
+    if source == target:
+        moved += 1
+        continue
+    try:
+        if KEEP_ORIGINAL:
+            # Relocating within one machine: the entry under the old name is
+            # the source project's own, and moving it would take its history
+            # away.
+            shutil.copy2(source, target)
+        else:
+            os.replace(source, target)
+            
+        moved += 1
+    except OSError:
+        pass
+print("tp<" + json.dumps({"moved": moved}) + ">tp")
+"""
+
+READ_STATE = """
+import json
+out = {"settings": None, "history": []}
+try:
+    with open(%(settings)s, encoding="utf-8") as fh:
+        out["settings"] = (json.load(fh).get("projects") or {}).get(%(key)s)
+except Exception:
+    pass
+try:
+    with open(%(history)s, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except Exception:
+                continue
+            if record.get("project") == %(key)s:
+                out["history"].append(record)
+except Exception:
+    pass
+print("tp<" + json.dumps(out) + ">tp")
+"""
+
+WRITE_STATE = """
+import base64, json, os
+payload = json.loads(base64.b64decode(%(payload)s).decode())
+result = {"settings": 0, "history": 0}
+
+
+def merge(existing, incoming):
+    '''Fold an incoming value into whatever the destination already had.
+
+    Lists are unioned rather than replaced or concatenated: replacing would
+    discard permissions granted on this machine, and concatenating would grow a
+    duplicate every single run.
+    '''
+    if isinstance(existing, list) and isinstance(incoming, list):
+        merged = list(existing)
+        for item in incoming:
+            if item not in merged:
+                merged.append(item)
+        return merged
+    if isinstance(existing, dict) and isinstance(incoming, dict):
+        merged = dict(existing)
+        for key, value in incoming.items():
+            merged[key] = merge(existing.get(key), value)
+        return merged
+    return incoming
+
+
+def fingerprint(line):
+    '''Compare history entries by content, not by how they were serialised:
+    key order and spacing differ between writers, and matching on the raw text
+    would append a fresh copy of every entry on each run.'''
+    try:
+        return json.dumps(json.loads(line), sort_keys=True, separators=(",", ":"))
+    except Exception:
+        return line
+
+if payload.get("settings"):
+    try:
+        with open(%(settings)s, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:
+        data = {}
+    projects = data.setdefault("projects", {})
+    existing = projects.setdefault(%(key)s, {})
+    for field, value in payload["settings"].items():
+        existing[field] = merge(existing.get(field), value)
+    tmp = %(settings)s + ".tp-tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2)     # the format Claude Code itself writes
+    os.replace(tmp, %(settings)s)
+    result["settings"] = 1
+
+incoming = payload.get("history") or []
+if incoming:
+    seen = set()
+    try:
+        with open(%(history)s, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if line:
+                    seen.add(fingerprint(line))
+    except Exception:
+        pass
+    fresh = []
+    for record in incoming:
+        line = json.dumps(record)
+        mark = fingerprint(line)
+        if mark in seen:
+            continue
+        seen.add(mark)          # also guards duplicates within one batch
+        fresh.append(line)
+    if fresh:
+        with open(%(history)s, "a", encoding="utf-8") as fh:
+            for line in fresh:
+                fh.write(line + chr(10))
+    result["history"] = len(fresh)
+
+print("tp<" + json.dumps(result) + ">tp")
+"""
+
+
+@dataclass
+class Endpoint:
+    """One side of the transfer.
+
+    `arg` is exactly what the user typed (modulo making a relative local path
+    absolute) and is what rsync receives — we never reinterpret it. The parsed
+    bits are used only to locate/compare Claude data.
+    """
+    arg: str
+    remote: bool
+    ssh: str           # "user@host", or "" when local
+    path: str          # path portion, trailing slash preserved
+    trailing: bool     # did the path end in '/'
+    _home: str = field(default="", repr=False)
+    _config: str = field(default="", repr=False)
+    _version: tuple | None = field(default=None, repr=False)
+
+    @classmethod
+    def parse(cls, raw: str) -> "Endpoint":
+        # "user@host:/path" — treat the part before the first ':' as an ssh
+        # target only if it contains no '/', so a local path is never mistaken
+        # for a host spec.
+        ssh, path, remote = "", raw, False
+        if ":" in raw:
+            head = raw.split(":", 1)[0]
+            if "/" not in head and not head.startswith("."):
+                ssh, path = raw.split(":", 1)
+                remote = True
+        return cls(arg=raw, remote=remote, ssh=ssh, path=path,
+                   trailing=path.endswith("/"))
+
+    def resolve(self) -> "Endpoint":
+        """Make `path` absolute, expanding a leading '~' against the *owning*
+        machine's $HOME.
+
+        rsync accepts `host:~/dev/`, so we must too — and we need the real
+        absolute path anyway to locate the Claude project dir. Expanding to the
+        same directory rsync would have used keeps both in agreement.
+        """
+        path = self.path
+        if path == "~" or path.startswith("~/"):
+            path = self.home + path[1:]
+        elif path.startswith("~"):
+            die(f"cannot expand '{path.split('/')[0]}' — "
+                f"use an absolute path or plain '~'")
+        elif not path.startswith("/"):
+            if self.remote:
+                die(f"remote path must be absolute or start with '~': {path}")
+            path = os.path.abspath(path)             # resolve against $PWD
+        if self.trailing and not path.endswith("/"):
+            path += "/"
+        self.path = path
+        self.arg = f"{self.ssh}:{path}" if self.remote else path
+        return self
+
+    # --- running things on whichever machine this side lives on -------------
+
+    def _ssh_cmd(self, *argv: str) -> list[str]:
+        return ["ssh", *SSH_OPTS, self.ssh, *argv]
+
+    def run(self, script: str) -> None:
+        """Run a bash script on this side.
+
+        BatchMode=yes matters: the script is fed on stdin, so an interactive
+        passphrase/host-key prompt would have nowhere to render and the whole
+        thing would hang forever. BatchMode turns that into a fast, visible
+        failure instead.
+        """
+        # A login shell, matching capture(): tools such as python3 may only be
+        # on the PATH that the login profile sets up (pyenv, homebrew, nix).
+        cmd = self._ssh_cmd("bash", "-ls") if self.remote else ["bash", "-s"]
+        subprocess.run(cmd, input=script, text=True, check=True)
+
+    def capture(self, script: str) -> str:
+        """Run a bash script on this side and return its stdout, stripped."""
+        cmd = self._ssh_cmd("bash", "-ls") if self.remote else ["bash", "-s"]
+        cp = subprocess.run(cmd, input=script, text=True,
+                            stdout=subprocess.PIPE, check=True)
+        return cp.stdout.strip()
+
+    def dir_exists(self, path: str) -> bool:
+        """True if `path` is a directory on this side. Never raises."""
+        script = f"test -d {shlex.quote(path)}"
+        cmd = self._ssh_cmd("bash", "-s") if self.remote else ["bash", "-s"]
+        return subprocess.run(cmd, input=script, text=True).returncode == 0
+
+    @property
+    def home(self) -> str:
+        """This side's $HOME, queried once and cached."""
+        if not self._home:
+            self._home = (self._probe("$HOME") if self.remote
+                          else os.path.expanduser("~"))
+            if not self._home:
+                die(f"could not determine $HOME on {self.ssh or 'this machine'}")
+        return self._home
+
+    @property
+    def config_dir(self) -> str:
+        """This side's Claude config dir.
+
+        The binary resolves it as `CLAUDE_CONFIG_DIR ?? $HOME/.claude`, so we
+        ask the same question rather than assuming `~/.claude`. The remote probe
+        runs through a login shell, since that is where such a variable would be
+        exported.
+        """
+        if not self._config:
+            if self.remote:
+                self._config = (self._probe("${CLAUDE_CONFIG_DIR:-$HOME/.claude}")
+                                or f"{self.home}/.claude")
+            else:
+                self._config = (os.environ.get("CLAUDE_CONFIG_DIR")
+                                or os.path.join(self.home, ".claude"))
+        return self._config
+
+    def _probe(self, expr: str) -> str:
+        """Evaluate a shell expression on the remote side, tolerating any
+        banner or profile chatter by tagging the value we care about."""
+        out = self.capture(f'printf "\\ntp<%s>tp\\n" "{expr}"')
+        match = TAGGED.search(out)
+        return match.group(1).strip() if match else ""
+
+    def python(self, program: str) -> str:
+        """Run a Python program on this side and return whatever it wrapped in
+        the tp<...>tp marker. Shipped base64-encoded so no quoting or heredoc
+        has to survive the trip through two shells."""
+        blob = base64.b64encode(program.encode()).decode()
+        out = self.capture(f"echo {shlex.quote(blob)} | base64 -d | python3 -")
+        match = TAGGED.search(out)
+        if not match:
+            die(f"unexpected output from {self.ssh or 'local'} helper:\n{out}")
+        return match.group(1)
+
+    def scan(self, root: str, want_manifest: bool = False) -> dict:
+        """Fingerprint every file under `root`: {relpath: [size, mtime_ns]}.
+
+        Size plus mtime is exactly the cheap check rsync itself trusts by
+        default, and it costs one stat per file rather than reading hundreds of
+        megabytes to hash them. Optionally returns the manifest in the same
+        round trip, so inspecting the destination costs one connection.
+        """
+        program = f'''
+import os, json
+ROOT = {root!r}
+MANIFEST = {MANIFEST_NAME!r}
+files = {{}}
+for dirpath, _dirs, names in os.walk(ROOT):
+    for name in names:
+        full = os.path.join(dirpath, name)
+        rel = os.path.relpath(full, ROOT)
+        if rel == MANIFEST:
+            continue
+        try:
+            st = os.stat(full)
+        except OSError:
+            continue
+        files[rel] = [st.st_size, st.st_mtime_ns]
+result = {{"files": files}}
+if {want_manifest!r}:
+    try:
+        with open(os.path.join(ROOT, MANIFEST)) as fh:
+            result["manifest"] = json.load(fh)
+    except Exception:
+        result["manifest"] = None
+print("tp<" + json.dumps(result) + ">tp")
+'''
+        return json.loads(self.python(program))
+
+    def write_manifest(self, proj_dir: str, manifest: dict) -> None:
+        blob = base64.b64encode(json.dumps(manifest).encode()).decode()
+        target = shlex.quote(os.path.join(proj_dir, MANIFEST_NAME))
+        self.run(f"echo {shlex.quote(blob)} | base64 -d > {target}")
+
+    @property
+    def claude_version(self) -> tuple | None:
+        """This side's Claude Code version, or None if it has none installed.
+
+        Only consulted for over-long paths, where the two machines may disagree
+        about the hash suffix, so the cost is not paid by ordinary transfers.
+        """
+        if self._version is None:
+            raw = (self._probe_version() if self.remote
+                   else _local_command("claude --version"))
+            found = re.search(r"(\d+)\.(\d+)\.(\d+)", raw or "")
+            self._version = tuple(int(g) for g in found.groups()) if found else ()
+        return self._version or None
+
+    def _probe_version(self) -> str:
+        try:
+            return self.capture('claude --version 2>/dev/null || true')
+        except subprocess.CalledProcessError:
+            return ""
+
+    def encode(self, code_dir: str) -> str:
+        """Encode `code_dir` the way *this* machine's Claude Code would."""
+        return encode_path(code_dir, self._long_hash)
+
+    def _long_hash(self, text: str) -> str:
+        version = self.claude_version
+        if version is not None and version < HASH_CHANGED_IN:
+            return bun_hash36(text)
+        if version is None:
+            print(f"   note: no Claude Code on {self.ssh or 'this machine'}; "
+                  f"assuming the >= {'.'.join(map(str, HASH_CHANGED_IN))} "
+                  f"naming for this over-long path")
+        return js31_hash36(text)
+
+    def proj_dir(self, code_dir: str) -> str:
+        """Where this side keeps Claude data for a project at `code_dir`."""
+        return f"{self.config_dir}/projects/{self.encode(code_dir)}"
+
+    @property
+    def settings_file(self) -> str:
+        return f"{self.home}/.claude.json"
+
+    @property
+    def history_file(self) -> str:
+        return f"{self.config_dir}/history.jsonl"
+
+    def plan_file_history(self, src_dir: str, dest_dir: str,
+                          sessions: list) -> list:
+        """Which /rewind snapshots to carry, and what to call them there."""
+        return json.loads(self.python(HISTORY_PLAN % {
+            "src_dir": repr(src_dir),
+            "dest_dir": repr(dest_dir),
+            "config": repr(self.config_dir),
+            "sessions": repr(sessions),
+        }))
+
+    def rekey_file_history(self, plan: list, keep_original: bool) -> dict:
+        blob = base64.b64encode(json.dumps(plan).encode()).decode()
+        return json.loads(self.python(HISTORY_RENAME % {
+            "config": repr(self.config_dir),
+            "plan": repr(blob),
+            "keep": repr(bool(keep_original)),
+        }))
+
+    def read_project_state(self, code_dir: str) -> dict:
+        """The settings entry and recalled prompts belonging to `code_dir`."""
+        return json.loads(self.python(READ_STATE % {
+            "settings": repr(self.settings_file),
+            "history": repr(self.history_file),
+            "key": repr(code_dir),
+        }))
+
+    def write_project_state(self, code_dir: str, payload: dict) -> dict:
+        """Merge a settings entry and prompt history in under `code_dir`.
+
+        Both are global files a running Claude Code may also be writing, so the
+        settings file is merged and replaced atomically rather than overwritten,
+        and history is de-duplicated so repeated runs never pile up.
+        """
+        blob = base64.b64encode(json.dumps(payload).encode()).decode()
+        return json.loads(self.python(WRITE_STATE % {
+            "settings": repr(self.settings_file),
+            "history": repr(self.history_file),
+            "key": repr(code_dir),
+            "payload": repr(blob),
+        }))
+
+    def loc(self, path: str) -> str:
+        """An rsync location string for an arbitrary path on this side."""
+        return f"{self.ssh}:{path}" if self.remote else path
+
+
+def effective_landing(src: Endpoint, dest: Endpoint) -> tuple[str, str]:
+    """Return (src_dir, dest_dir): the absolute directories whose contents end
+    up mirrored, per rsync's trailing-slash rule.
+
+        rsync SRC/ DEST  -> DEST receives SRC's contents => dest_dir = DEST
+        rsync SRC  DEST  -> DEST/basename(SRC) is made   => dest_dir = DEST/base
+
+    Used only to locate Claude data; it never alters what rsync is given.
+    """
+    src_dir = src.path.rstrip("/") or "/"
+    dest_base = dest.path.rstrip("/") or "/"
+    dest_dir = dest_base if src.trailing \
+        else f"{dest_base}/{os.path.basename(src_dir)}"
+    return src_dir, dest_dir
+
+
+def rsync(src_arg: str, dest_arg: str, opts: list[str]) -> None:
+    cmd = ["rsync", *opts, src_arg, dest_arg]
+    print("   $", " ".join(shlex.quote(c) for c in cmd))
+    subprocess.run(cmd, check=True)
+
+
+def build_subs(src: Endpoint, dest: Endpoint,
+               src_dir: str, dest_dir: str) -> list[tuple[str, str]]:
+    """The path substitutions applied inside the teleported session files.
+
+    Three are needed, and each covers a case the others miss:
+      * the encoded project-dir name — appears in sessions-index.json and
+        cross-references; contains no '/', so the path rules can't touch it.
+      * the full code dir — rewrites `cwd` and every file path inside the
+        project. This is the one that carries a local->local relocation, where
+        $HOME is unchanged and the home rule below is a no-op.
+      * $HOME — catches everything referenced outside the project: other repos,
+        ~/.claude/projects/... entries, ~/.config, skills, etc. Dropping this
+        leaves stale foreign paths behind on a cross-machine hop.
+
+    Applied longest-first so a shorter rule can't clip a longer match.
+    """
+    pairs = [
+        (src.encode(src_dir), dest.encode(dest_dir)),
+        (src_dir, dest_dir),
+        (src.home, dest.home),
+    ]
+    seen: set[str] = set()
+    subs = []
+    for old, new in sorted(pairs, key=lambda p: len(p[0]), reverse=True):
+        if old != new and old not in seen:
+            seen.add(old)
+            subs.append((old, new))
+    return subs
+
+
+def main() -> None:
+    # Our prints go through Python's buffer while rsync/ssh write straight to
+    # the terminal; without line buffering the two streams land out of order.
+    sys.stdout.reconfigure(line_buffering=True)
+
+    ap = argparse.ArgumentParser(
+        prog="tp-claude",
+        description="Teleport a project's code plus its Claude Code sessions.")
+    ap.add_argument("src", help="path or user@host:/path (rsync semantics)")
+    ap.add_argument("dest", help="path or user@host:/path (rsync semantics)")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="show what would transfer; changes nothing")
+    ap.add_argument("--delete", action="store_true",
+                    help="mirror exactly, pruning files on the destination "
+                         "that no longer exist on the source (off by default)")
+    ap.add_argument("-v", "--verbose", action="store_true",
+                    help="list every transferred file (off by default)")
+    ap.add_argument("--full", action="store_true",
+                    help="ignore the manifest and resend every session file")
+    args = ap.parse_args()
+
+    src = Endpoint.parse(args.src)
+    dest = Endpoint.parse(args.dest)
+
+    if src.remote and dest.remote:
+        die("remote -> remote is not supported (one side must be local)")
+
+    src.resolve()
+    dest.resolve()
+
+    # A project is a directory plus its Claude data, so quietly ignore anything
+    # else. That keeps a sloppy `ls | xargs tp-claude` from erroring on the
+    # loose files that happen to sit alongside the project dirs.
+    if not src.dir_exists(src.path.rstrip("/") or "/"):
+        print(f">> skip: {src.arg} is not a directory")
+        return
+
+    src_dir, dest_dir = effective_landing(src, dest)
+    same_machine = not src.remote and not dest.remote
+    if same_machine and src_dir == dest_dir:
+        die(f"source and destination are the same directory ({src_dir})")
+
+    src_proj = src.proj_dir(src_dir)
+    dest_proj = dest.proj_dir(dest_dir)
+    # Claude's encoding is lossy — '/' and '-' both become '-', so distinct
+    # directories can share one project dir (e.g. ~/foo-bar and ~/foo/bar). On
+    # a single machine that would make us sync a directory onto itself and then
+    # rewrite the original sessions in place, destroying them.
+    if same_machine and src_proj == dest_proj:
+        die(f"{src_dir} and {dest_dir} share one Claude project directory\n"
+            f"  ({src_proj})\n"
+            f"  syncing would overwrite the original sessions — refusing.")
+
+    rsync_opts = ["-az", "--stats"]           # --stats is the portable summary;
+    if args.verbose:                          # openrsync (macOS) rejects --info
+        rsync_opts.append("-v")
+    if args.delete:
+        rsync_opts.append("--delete")
+    if args.dry_run:
+        rsync_opts.append("-n")
+
+    print(">> tp-claude" + ("  (dry run)" if args.dry_run else ""))
+    print(f"   code : {src.arg}  ->  {dest.arg}")
+    print(f"   data : {src.loc(src_proj)}  ->  {dest.loc(dest_proj)}")
+    print()
+
+    print(">> [1/4] syncing code ...")
+    rsync(src.arg, dest.arg, rsync_opts)
+
+    print(">> [2/4] syncing Claude session data ...")
+    if not src.dir_exists(src_proj):
+        # Never opened in Claude Code here — nothing to carry over. Exit 0 so a
+        # batch loop keeps going.
+        print(f"   nothing at {src.loc(src_proj)} — code only, no sessions.")
+        if not args.dry_run:
+            migrate_project_state(src, dest, src_dir, dest_dir,
+                                  build_subs(src, dest, src_dir, dest_dir))
+        print(f"\n>> done (code only): {dest_dir}")
+        return
+
+    subs = build_subs(src, dest, src_dir, dest_dir)
+
+    if args.dry_run:
+        rsync(f"{src.loc(src_proj)}/", f"{dest.loc(dest_proj)}/", rsync_opts)
+        print("\n>> dry run: no path rewrite performed.")
+        return
+
+    dest.run(f"mkdir -p {shlex.quote(dest_proj)}")
+    todo = plan_transfer(src, dest, src_proj, dest_proj, subs,
+                         src_dir, dest_dir, full=args.full or args.delete)
+
+    if todo.files is None:                       # no usable manifest: sync all
+        rsync(f"{src.loc(src_proj)}/", f"{dest.loc(dest_proj)}/", rsync_opts)
+    elif todo.files:
+        print(f"   {len(todo.files)} of {len(todo.src_files)} file(s) changed")
+        rsync_files(src, dest, src_proj, dest_proj, todo.files, rsync_opts)
+    else:
+        print(f"   all {len(todo.src_files)} file(s) already up to date")
+
+    print(">> [3/4] rewriting embedded paths ...")
+    if not subs:
+        print("   paths identical on both sides — nothing to rewrite")
+    elif todo.files is not None and not todo.files:
+        print("   nothing transferred — nothing to rewrite")
+    else:
+        program = _rewriter_program(dest_proj, subs, todo.files)
+        blob = base64.b64encode(program.encode()).decode()
+        # Ship the program base64-encoded rather than as a heredoc: the bash
+        # script itself already occupies ssh's stdin, and a nested heredoc
+        # would fight it for the same stream.
+        dest.run(f"echo {shlex.quote(blob)} | base64 -d | python3 -")
+
+    record_manifest(src, dest, src_proj, dest_proj, subs, src_dir, dest_dir)
+    migrate_file_history(src, dest, src_dir, dest_dir, src_proj, rsync_opts)
+    migrate_project_state(src, dest, src_dir, dest_dir, subs)
+    print(f"\n>> done. resume with:  cd {dest_dir} && claude --resume")
+
+
+@dataclass
+class Transfer:
+    src_files: dict           # relpath -> [size, mtime_ns] on the source
+    files: list | None        # what to send; None means "everything"
+
+
+def plan_transfer(src: Endpoint, dest: Endpoint, src_proj: str, dest_proj: str,
+                  subs: list, src_dir: str, dest_dir: str,
+                  full: bool) -> Transfer:
+    """Decide which session files actually need sending.
+
+    Rewriting paths makes every destination file differ from its source, so
+    rsync on its own would resend the lot on every run. The manifest we leave
+    behind records, per file, both the source fingerprint we copied from and
+    the destination fingerprint we produced. A file can be skipped only when
+    *both* still hold: an edited source means new content to carry over, and a
+    destination that no longer matches what we wrote means something else
+    changed it and our copy can no longer be trusted.
+    """
+    src_state = src.scan(src_proj)
+    src_files = src_state["files"]
+    if full:
+        return Transfer(src_files, None)
+
+    dest_state = dest.scan(dest_proj, want_manifest=True)
+    manifest = dest_state.get("manifest")
+    if not _manifest_applies(manifest, mapping_digest(subs, src_dir, dest_dir)):
+        return Transfer(src_files, None)
+
+    previous = manifest["files"]
+    dest_files = dest_state["files"]
+    changed = [
+        rel for rel, fingerprint in sorted(src_files.items())
+        if rel not in previous
+        or previous[rel][:2] != fingerprint
+        or previous[rel][2:] != dest_files.get(rel)
+    ]
+    return Transfer(src_files, changed)
+
+
+def mapping_digest(subs, src_dir: str, dest_dir: str) -> str:
+    """Identify the source-to-destination mapping without describing it.
+
+    The manifest only ever needs to answer "is this still the same mapping?",
+    so it stores this digest rather than the paths themselves. Recording them
+    in the clear would leave the source machine's directory layout and $HOME
+    sitting on the destination for no benefit.
+    """
+    payload = json.dumps(
+        {"src": src_dir, "dest": dest_dir,
+         "subs": [list(pair) for pair in subs]},
+        sort_keys=True)
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _manifest_applies(manifest, digest: str) -> bool:
+    """A manifest only describes the run that produced it; if the mapping has
+    moved since, every file has to be redone."""
+    return bool(
+        manifest
+        and manifest.get("version") == MANIFEST_VERSION
+        and manifest.get("mapping") == digest
+        and isinstance(manifest.get("files"), dict)
+    )
+
+
+def rsync_files(src: Endpoint, dest: Endpoint, src_proj: str, dest_proj: str,
+                files: list, opts: list) -> None:
+    """Send just `files` (paths relative to the project dir)."""
+    with tempfile.NamedTemporaryFile("w", suffix=".tpfiles",
+                                     delete=False) as handle:
+        handle.write("\n".join(files) + "\n")
+        listing = handle.name
+    try:
+        rsync(f"{src.loc(src_proj)}/", f"{dest.loc(dest_proj)}/",
+              opts + [f"--files-from={listing}"])
+    finally:
+        os.unlink(listing)
+
+
+def record_manifest(src: Endpoint, dest: Endpoint, src_proj: str,
+                    dest_proj: str, subs: list,
+                    src_dir: str, dest_dir: str) -> None:
+    """Re-fingerprint both sides and leave the result on the destination."""
+    src_files = src.scan(src_proj)["files"]
+    dest_files = dest.scan(dest_proj)["files"]
+    dest.write_manifest(dest_proj, {
+        "version": MANIFEST_VERSION,
+        "mapping": mapping_digest(subs, src_dir, dest_dir),
+        "files": {rel: list(fingerprint) + list(dest_files.get(rel, []))
+                  for rel, fingerprint in src_files.items()
+                  if rel in dest_files},
+    })
+
+
+def migrate_file_history(src: Endpoint, dest: Endpoint, src_dir: str,
+                         dest_dir: str, src_proj: str, opts: list) -> None:
+    """Carry the file snapshots that /rewind restores from.
+
+    They live outside the project directory, keyed by session id, and their
+    filenames hash the absolute path of the file they snapshot — so they are
+    copied under their original names and then re-keyed to the destination's
+    paths. Snapshots of files that no longer exist are left behind: there is
+    nothing to re-key them against.
+    """
+    sessions = sorted({os.path.basename(rel)[:-len(".jsonl")]
+                       for rel in src.scan(src_proj)["files"]
+                       if rel.endswith(".jsonl") and "/" not in rel})
+    if not sessions:
+        return
+    plan = src.plan_file_history(src_dir, dest_dir, sessions)
+    if not plan:
+        return
+
+    # When both sides are the same machine and share a config directory the
+    # entries are already in place, and the ones under the old names belong to
+    # the source project rather than being copies we made.
+    shared = (not src.remote and not dest.remote
+              and src.config_dir == dest.config_dir)
+    if not shared:
+        with tempfile.NamedTemporaryFile("w", suffix=".tpfiles",
+                                         delete=False) as handle:
+            handle.write("\n".join(old for old, _new in plan) + "\n")
+            listing = handle.name
+        try:
+            rsync(f"{src.loc(src.config_dir)}/",
+                  f"{dest.loc(dest.config_dir)}/",
+                  opts + [f"--files-from={listing}"])
+        finally:
+            os.unlink(listing)
+
+    moved = dest.rekey_file_history(plan, keep_original=shared).get("moved", 0)
+    print(f"   carried over {moved} rewind snapshot(s)")
+
+
+def migrate_project_state(src: Endpoint, dest: Endpoint, src_dir: str,
+                          dest_dir: str, subs) -> None:
+    """Carry the project's settings entry and prompt history across.
+
+    Without this the code and transcripts arrive but Claude Code treats the
+    destination as a project it has never seen: the trust dialog reappears and
+    every previously granted tool permission is asked for again.
+    """
+    print(">> [4/4] carrying over project settings ...")
+    state = src.read_project_state(src_dir)
+    settings = state.get("settings")
+    history = state.get("history") or []
+    if not settings and not history:
+        print("   nothing recorded for this project")
+        return
+
+    # The stored values mention the old location, so they get the same
+    # boundary-aware rewrite the session files receive.
+    payload = json.loads(apply_subs(json.dumps({
+        "settings": durable_settings(settings) if settings else None,
+        "history": history,
+    }), subs))
+
+    written = dest.write_project_state(dest_dir, payload)
+    parts = []
+    if written.get("settings"):
+        parts.append("settings")
+    if written.get("history"):
+        parts.append(f"{written['history']} recalled prompt(s)")
+    print(f"   carried over {' and '.join(parts)}" if parts
+          else "   already up to date")
+
+
+def _rewriter_program(proj_dir: str, subs: list[tuple[str, str]],
+                      only: list | None = None) -> str:
+    """A self-contained program that rewrites the embedded paths in place,
+    executed on whichever machine now holds the teleported data.
+
+    `only` limits the work to the files just transferred; everything else was
+    rewritten by an earlier run and is already correct.
+    """
+    return f"""\
+import os, re
+PROJ_DIR = {proj_dir!r}
+SUBS = {subs!r}
+ONLY = {only!r}
+EXTS = (".jsonl", ".json", ".md", ".txt")
+TMP_SUFFIX = ".tp-tmp"
+
+# Match each path only at a component boundary, so that rewriting "…/Flow"
+# cannot corrupt a sibling "…/Flow2" that merely starts with the same text.
+RULES = [(re.compile(re.escape(old) + r"(?![A-Za-z0-9._-])"), new)
+         for old, new in SUBS]
+
+def rewrite(path):
+    \"\"\"Stream the file a line at a time. Session transcripts reach hundreds of
+    megabytes, and slurping one whole would cost several times its size in
+    memory once the substitution passes copy it around.\"\"\"
+    tmp = path + TMP_SUFFIX
+    touched = False
+    try:
+        with open(path, "r", encoding="utf-8") as src, \\
+             open(tmp, "w", encoding="utf-8") as dst:
+            for line in src:
+                out = line
+                for pattern, new in RULES:
+                    out = pattern.sub(lambda _m, n=new: n, out)
+                if out != line:
+                    touched = True
+                dst.write(out)
+    except (UnicodeDecodeError, OSError):
+        # binary, unreadable, or vanished mid-run: leave the original alone
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        return False
+    if touched:
+        os.replace(tmp, path)     # atomic: never a half-written session file
+    else:
+        os.remove(tmp)
+    return touched
+
+def targets():
+    if ONLY is not None:
+        for rel in ONLY:
+            yield os.path.join(PROJ_DIR, rel)
+        return
+    for root, _dirs, files in os.walk(PROJ_DIR):
+        for name in files:
+            yield os.path.join(root, name)
+
+for root, _dirs, files in os.walk(PROJ_DIR):
+    for name in files:
+        if name.endswith(TMP_SUFFIX):
+            os.remove(os.path.join(root, name))   # debris from an interruption
+
+changed = 0
+for path in targets():
+    if path.endswith(EXTS) and rewrite(path):
+        changed += 1
+print(f"   rewrote {{changed}} file(s)")
+"""
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except subprocess.CalledProcessError as e:
+        die(f"command failed (exit {e.returncode})")
+    except FileNotFoundError as e:
+        die(f"missing command: {e.filename}")
+    except KeyboardInterrupt:
+        die("interrupted")
