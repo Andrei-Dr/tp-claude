@@ -460,3 +460,66 @@ def test_the_source_snapshots_are_left_alone(world):
     world.run(world.src, f"{world.dest_parent}/")
     assert (world.config / "file-history" / session /
             f"{original}@v1").exists()
+
+
+# --- symlinked locations ----------------------------------------------------
+#
+# Claude Code realpaths the working directory before naming a project, so a
+# project reached through a symlink is filed under the target. tp-claude must
+# key its data off the same resolved path or the sessions land where Claude
+# will never look — the symptom being an empty `claude --resume`.
+
+def test_data_follows_a_symlinked_destination(world, tmp_path):
+    """dest given via a symlink -> data must land under the real path."""
+    real = tmp_path / "real-store"
+    real.mkdir()
+    link = tmp_path / "linked-store"
+    link.symlink_to(real)
+
+    world.seed_session()
+    world.run(world.src, f"{link}/")
+
+    landed_real = real / world.src.name
+    assert world.project_dir(landed_real).exists()          # realpath-encoded
+    assert not world.project_dir(link / world.src.name).exists()  # not the link
+    session = world.project_dir(landed_real) / "session.jsonl"
+    assert json.loads(session.read_text().splitlines()[0])["cwd"] == str(
+        landed_real)
+
+
+def test_data_follows_a_symlinked_source(world, tmp_path):
+    """src reached via a symlink -> data located under the real path too."""
+    real = tmp_path / "real-src"
+    real.mkdir()
+    (real / "main.py").write_text("print('hi')\n")
+    link = tmp_path / "linked-src"
+    link.symlink_to(real)
+
+    # seed the session under the *resolved* path, as Claude Code would have
+    d = world.project_dir(real)
+    d.mkdir(parents=True)
+    (d / "session.jsonl").write_text(
+        json.dumps({"cwd": str(real), "file": f"{real}/main.py"}) + "\n")
+
+    dest = tmp_path / "out"
+    world.run(f"{link}/", f"{dest}/")
+
+    assert (dest / "main.py").exists()
+    assert world.project_dir(dest).exists()
+    session = world.project_dir(dest) / "session.jsonl"
+    assert json.loads(session.read_text().splitlines()[0])["cwd"] == str(dest)
+
+
+def test_symlinked_dest_that_does_not_exist_yet(world, tmp_path):
+    """A brand-new project name under a symlinked parent still resolves: only
+    the existing ancestor is realpathed, the new leaf is re-appended."""
+    real = tmp_path / "real-parent"
+    real.mkdir()
+    link = tmp_path / "linked-parent"
+    link.symlink_to(real)
+
+    world.seed_session()
+    world.run(world.src, f"{link}/")          # creates <real>/proj fresh
+
+    assert (real / world.src.name / "main.py").exists()
+    assert world.project_dir(real / world.src.name).exists()

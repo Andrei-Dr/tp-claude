@@ -464,6 +464,32 @@ class Endpoint:
         cmd = self._ssh_cmd("bash", "-s") if self.remote else ["bash", "-s"]
         return subprocess.run(cmd, input=script, text=True).returncode == 0
 
+    def resolve_dir(self, path: str) -> str:
+        """Resolve symlinks in `path` the way Claude Code does before it names a
+        project directory: it realpaths the working directory, so a project
+        reached through a symlink (e.g. ~/dev -> /mnt/md0/dev) is filed under
+        the target, not the link. We must key our data off the same resolved
+        path or the sessions land where Claude will never look.
+
+        A trailing component that does not exist yet (the destination on a first
+        sync) can't be realpathed, so only the deepest existing ancestor is
+        resolved and the remainder re-appended.
+        """
+        program = f'''
+import os
+path = {path!r}
+parts = []
+probe = path.rstrip("/") or "/"
+while probe and probe != "/" and not os.path.exists(probe):
+    probe, tail = os.path.split(probe)
+    parts.append(tail)
+resolved = os.path.realpath(probe)
+for tail in reversed(parts):
+    resolved = os.path.join(resolved, tail)
+print("tp<" + resolved + ">tp")
+'''
+        return self.python(program)
+
     @property
     def home(self) -> str:
         """This side's $HOME, queried once and cached."""
@@ -732,6 +758,14 @@ def main() -> None:
         return
 
     src_dir, dest_dir = effective_landing(src, dest)
+    # Resolve symlinks on each machine, because Claude Code realpaths the
+    # working directory before it names the project dir. Without this a project
+    # reached through a symlink (e.g. /home/me/dev -> /mnt/md0/dev) has its data
+    # filed under the link while Claude looks under the target — sessions vanish.
+    # The code rsync still uses the literal paths above; only the data mapping
+    # and the in-file rewrite follow the resolved ones.
+    src_dir = src.resolve_dir(src_dir)
+    dest_dir = dest.resolve_dir(dest_dir)
     same_machine = not src.remote and not dest.remote
     if same_machine and src_dir == dest_dir:
         die(f"source and destination are the same directory ({src_dir})")
@@ -747,11 +781,19 @@ def main() -> None:
             f"  ({src_proj})\n"
             f"  syncing would overwrite the original sessions — refusing.")
 
-    rsync_opts = ["-az", "--stats"]           # --stats is the portable summary;
-    if args.verbose:                          # openrsync (macOS) rejects --info
+    # -a implies -l, so symlinks are copied as symlinks (their targets ride
+    # along in the same tree). --stats is the portable summary; openrsync on
+    # macOS rejects --info/--progress2.
+    rsync_opts = ["-az", "--stats"]
+    if args.verbose:
         rsync_opts.append("-v")
     if args.delete:
-        rsync_opts.append("--delete")
+        # --force lets rsync clear a non-empty directory when the source now
+        # has a symlink (or file) in its place; without it rsync refuses and
+        # silently leaves the stale directory behind. It only fires on that
+        # replace-with-non-directory conflict, so it rides with --delete rather
+        # than being a standalone footgun.
+        rsync_opts += ["--delete", "--force"]
     if args.dry_run:
         rsync_opts.append("-n")
 

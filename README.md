@@ -101,6 +101,12 @@ NFC-normalised first, which matters on macOS: the filesystem returns decomposed
 names, so `é` arrives as `e` + a combining accent and would otherwise encode
 differently from the composed form.
 
+The path is also **realpath-resolved** before encoding, so a project reached
+through a symlink (say `/home/me/dev -> /mnt/md0/dev`) is filed under the
+target, not the link. tp-claude resolves symlinks on each machine to match — if
+it didn't, teleporting into a symlinked directory would file the sessions where
+Claude Code never looks, and `claude --resume` would come up empty.
+
 Because the encoding is lossy — `/` and `-` both become `-` — two different
 directories can share one session directory (`~/foo-bar` and `~/foo/bar`).
 tp-claude refuses same-machine transfers that collide, since proceeding would
