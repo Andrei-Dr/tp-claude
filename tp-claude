@@ -1011,13 +1011,20 @@ def _looks_secret(entry: str) -> bool:
 
 
 def _looks_derived(entry: str) -> bool:
-    """True if the entry's own name says a tool produced it."""
+    """True if the entry's own name says a tool produced it.
+
+    A derived directory has a short, conventional name -- dist, build, .cache,
+    build-cache. A long hyphenated phrase that happens to contain one of those
+    words is somebody describing their own directory ("build-artifacts-i-hand-
+    made"), so the word has to account for the name rather than appear inside
+    a sentence.
+    """
     lowered = entry.lower().rstrip("/")
     tail = lowered.rsplit("/", 1)[-1]
-    for chunk in re.split(r"[._\-]+", tail):
-        if chunk in DERIVED_WORDS:
-            return True
-    return False
+    chunks = [c for c in re.split(r"[._\-]+", tail) if c]
+    if len(chunks) > 3:
+        return False
+    return any(chunk in DERIVED_WORDS for chunk in chunks)
 
 
 def gitignore_skips(text: str, already: set) -> tuple[list, list]:

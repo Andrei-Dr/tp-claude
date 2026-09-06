@@ -232,3 +232,23 @@ def test_static_cache_rule_matches_cache_files(tpc):
     for name in (".php-cs-fixer.cache", ".phpunit.cache",
                  ".phpunit.result.cache", ".DS_Store"):
         assert name in pats and f"{name}/" not in pats
+
+
+def test_does_not_adopt_a_long_name_that_merely_contains_a_derived_word(tpc):
+    """`/build-artifacts-i-hand-made` is not build output despite the words.
+
+    A derived name is short and conventional (dist, build, .cache). A long
+    hyphenated phrase is somebody describing their own directory, so the word
+    has to account for the name rather than sit inside a sentence.
+    """
+    for entry in ("/build-artifacts-i-hand-made", "/output-of-my-research",
+                  "/logs-i-actually-need", "/cache-of-hand-labelled-data"):
+        adopted, _ = tpc.gitignore_skips(entry + "\n", set())
+        assert adopted == [], entry
+
+
+def test_still_adopts_conventional_compound_names(tpc):
+    """Two-part names that are genuinely conventional stay adopted."""
+    for entry in ("/build-cache", "/dist-prod", "/.turbo-cache"):
+        adopted, _ = tpc.gitignore_skips(entry + "\n", set())
+        assert adopted == [entry], entry
