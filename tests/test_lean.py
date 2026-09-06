@@ -166,7 +166,7 @@ def test_never_adopts_dotenv(tpc):
 
 
 def test_never_adopts_credentials_or_keys(tpc):
-    text = ("/storage/*.key\ne2e/.portal-credentials.json\n"
+    text = ("/storage/*.key\ntest/.db-credentials.json\n"
             ".mcp.json\nid_rsa\nsecrets.json\n*.pem\n")
     adopted, _ = tpc.gitignore_skips(text, set())
     assert adopted == []

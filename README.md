@@ -296,12 +296,12 @@ file.
 | --- | --- | :---: |
 | derived | `/public/build`, `.turbo/` | ✅ |
 | secrets | `.env`, `*.key`, `.mcp.json`, credentials | ❌ the destination cannot run without them |
-| local data | uploads, generated assets (one real repo ignores 196 MB of them) | ❌ nothing regenerates them |
+| local data | uploads, generated assets — often hundreds of MB | ❌ nothing regenerates them |
 
 So entries are adopted only when the name itself says a tool produced them, and
 never when it could name a credential. That lets a project's own `.gitignore`
-contribute the build directories no generic rule knows about — `/public/build`
-in the Laravel app above — while `.env` still travels. Anything adopted this
+contribute the build directories no generic rule knows about — a
+framework-specific `/public/build`, say — while `.env` still travels. Anything adopted this
 way is printed, so a skip is never silent. An ambiguous entry like
 `/public/css` is left alone: it is build output in one repo and hand-written in
 another, and under-skipping costs bandwidth while over-skipping costs source.
