@@ -39,7 +39,7 @@ tp-claude ~/src/app ~/archive/
 | flag | effect |
 | --- | --- |
 | `--lean` | skip dependency trees and build output a package manager can rebuild (aliases: `--no-vendors`, `--no-deps`) |
-| `--no-worktrees` | skip `.claude/worktrees` — agent git checkouts naming this machine's paths |
+| `--no-worktrees` | skip `.claude/worktrees` at any depth — agent git checkouts naming this machine's paths |
 | `--exclude=PATTERN` | one more rsync exclude; repeatable |
 | `--no-lean-rule=NAME` | turn off a single `--lean` rule (`node`, `php`, `go`, `rust`, `python`, `ruby`, `laravel`, `build`, `cache`) |
 | `--dry-run` | report what would move; changes nothing |

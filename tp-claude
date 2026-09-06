@@ -246,6 +246,11 @@ LEAN_RULES = (
 # Agent worktrees are git checkouts made on this machine, naming this machine's
 # paths and pids. They are not build output and not dependencies, so they get
 # their own flag rather than riding along with --lean.
+#
+# Deliberately unanchored, unlike the rules above: a worktree is machine-local
+# wherever it sits, so one nested in a workspace package arrives just as broken
+# as one at the root. There is no ambiguous case to protect here -- the path is
+# specific enough that nothing else can collide with it.
 WORKTREE_PATTERNS = (".claude/worktrees/",)
 
 

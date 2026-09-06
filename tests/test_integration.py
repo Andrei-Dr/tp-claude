@@ -750,3 +750,19 @@ def test_lean_skips_nested_projects_under_a_parent_directory(world):
     assert (out / "appB" / "vendor" / "mine" / "code.rs").exists()
     for name in ("appA", "appB", "appC"):
         assert (out / name / "src.txt").exists()
+
+
+def test_no_worktrees_matches_at_any_depth(world):
+    """A worktree is machine-local wherever it sits, so a nested one arrives
+    just as broken as one at the root. Unlike the ecosystem rules there is no
+    ambiguous case to protect: the path is specific enough not to collide."""
+    for rel in (".claude/worktrees/t1/f.txt",
+                "packages/ui/.claude/worktrees/t2/f.txt"):
+        target = world.src / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("scratch\n")
+    (world.src / "packages" / "ui" / "button.tsx").write_text("src\n")
+    world.run("--no-worktrees", world.src, f"{world.dest_parent}/")
+    assert not (world.landed / ".claude" / "worktrees").exists()
+    assert not (world.landed / "packages/ui/.claude/worktrees").exists()
+    assert (world.landed / "packages" / "ui" / "button.tsx").exists()
