@@ -254,27 +254,47 @@ build with a confusing error rather than an honest missing-dependency one.
 tp-claude --lean ~/dev/app  me@server:/home/me/dev/
 ```
 
-Measured on two real projects:
+Measured on real projects across several stacks:
 
 | project | default | `--lean` |
 | --- | --- | --- |
-| pnpm monorepo (Next.js, turbo) | 8.9 GB / 113,753 files | 197 MB / 5,969 files |
-| Laravel app (Composer + npm) | 2.8 GB / 139,098 files | 1.3 GB / 6,446 files |
+| pnpm monorepo (Next.js, turbo) | 8.3 GB / 113,753 files | 188 MB / 5,969 files |
+| Rust + React (Cargo, npm) | 2.6 GB / 23,722 files | 33 MB / 1,529 files |
+| Go + React + Python ETL | 3.8 GB / 89,399 files | 767 MB / 28,530 files |
+| Laravel + npm (Composer) | 2.6 GB / 139,098 files | 1.2 GB / 6,446 files |
+| Go CLI, nothing installed | 19.4 MB / 213 files | 19.4 MB / 210 files |
+
+The last row is the honest case: a repo whose dependencies were never installed
+has nothing to skip, and `--lean` costs it a survey and saves it nothing.
 
 Two things keep this from destroying work.
 
-**Rules are gated on a manifest.** `vendor/` means "installed by Composer" next
-to a `composer.json` and "a directory somebody named vendor" otherwise;
-`target/` is Cargo's output only next to a `Cargo.toml`. Matching on the name
-alone would delete source.
+**Rules are gated on a manifest.** The same directory name means different
+things in different projects, so a rule only fires when something proves the
+directory was generated:
 
-**Rules are scoped by path.** Laravel's `storage/` holds regenerable caches and
-logs next to `storage/app`, which is user uploads that no reinstall can bring
-back — so the patterns name `storage/logs` and `storage/framework`, never
-`storage` itself. Anchoring works the same way: `/vendor/` is the Composer one
-at the root, while a `resources/vendor/` of hand-written code is untouched.
-`node_modules` is deliberately *not* anchored, since workspaces nest one per
-package and all of them are derived.
+| name | derived when | otherwise |
+| --- | --- | --- |
+| `vendor/` | beside a `composer.json` or `go.mod` | a directory somebody named vendor |
+| `target/` | beside a `Cargo.toml` | a build target, an output folder, anything |
+| `dist/` | beside any manifest | hand-written files someone distributes |
+| `bin/` | never — no rule skips it | committed scripts, far more often than not |
+
+Matching on the name alone would delete source.
+
+**Rules are scoped by path**, because a directory that is *mostly* derived can
+still hold something unrecoverable. Laravel's `storage/` is the sharpest case —
+`storage/logs` and `storage/framework` regenerate, while `storage/app` is user
+uploads that no reinstall brings back — so the patterns name the two, never
+`storage` itself. The same reasoning keeps `/vendor/` anchored to the root
+(a `resources/vendor/` of hand-written code is untouched) and leaves
+`node_modules` unanchored (workspaces nest one per package, and all of them are
+derived).
+
+Multi-language repos get the union: a Go API with a React admin panel and a
+Python ETL job matches the `go`, `node`, `python` and `build` rules at once, and
+each anchored pattern is emitted per project directory, so a monorepo's
+`services/api/vendor/` and `ui/dist/` both go while a sibling's do not.
 
 | rule | needs | skips |
 | --- | --- | --- |
@@ -362,6 +382,18 @@ present, with `packageManager` breaking ties when a repo carries more than one:
 
      cd /home/me/dev/app && pnpm install --frozen-lockfile
 ```
+
+A repo with several ecosystems gets them chained in one line, so a Go API with
+a React panel and a Python ETL job comes back with:
+
+```
+     cd /home/me/dev/app && npm ci && uv sync && go mod download
+```
+
+Ties are resolved rather than duplicated: `packageManager` picks between a
+`pnpm-lock.yaml` and a stray `package-lock.json`, and a `uv.lock` or
+`poetry.lock` suppresses a `requirements.txt` beside it, since that file is
+usually an export of the lockfile rather than a second thing to install.
 
 It is printed and never run. Reinstalling is a long, network-bound build that
 can fail on its own terms, and making it a side effect of a sync would leave a

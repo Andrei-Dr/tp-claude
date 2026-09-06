@@ -766,3 +766,18 @@ def test_no_worktrees_matches_at_any_depth(world):
     assert not (world.landed / ".claude" / "worktrees").exists()
     assert not (world.landed / "packages/ui/.claude/worktrees").exists()
     assert (world.landed / "packages" / "ui" / "button.tsx").exists()
+
+
+def test_lean_keeps_downloaded_model_weights(world):
+    """Model weights sit loose beside the code and no reinstall reproduces
+    them, so nothing may skip them even though the .venv around them goes."""
+    (world.src / "pyproject.toml").write_text('[project]\nname = "x"\n')
+    (world.src / ".venv" / "lib").mkdir(parents=True)
+    (world.src / ".venv" / "lib" / "pkg.py").write_text("installed\n")
+    for name in ("yolo26s.pt", "model.onnx", "weights.safetensors"):
+        (world.src / name).write_text("binary blob\n")
+    out = world.run("--lean", world.src, f"{world.dest_parent}/").stdout
+    assert not (world.landed / ".venv").exists()
+    for name in ("yolo26s.pt", "model.onnx", "weights.safetensors"):
+        assert (world.landed / name).exists(), name
+    assert "pip install -e ." in out          # lockless pyproject still guided

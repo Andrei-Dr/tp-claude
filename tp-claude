@@ -1279,6 +1279,29 @@ INSTALL_COMMANDS = (
 # sitting beside it redundant rather than a second thing to install.
 PYTHON_LOCKS = ("uv.lock", "poetry.lock", "Pipfile.lock", "pdm.lock")
 
+# What to suggest when a manifest brought no lockfile with it. Weaker advice --
+# nothing pins the versions, and the preflight says so -- but skipping a
+# dependency tree and then printing no way to rebuild it is worse than
+# suggesting the unpinned install the project's own manifest implies.
+MANIFEST_COMMANDS = {
+    "pyproject.toml": "pip install -e .",
+    "setup.py": "pip install -e .",
+    "package.json": "npm install",
+    "composer.json": "composer install",
+    "Cargo.toml": "cargo build",
+    "go.mod": "go mod download",
+    "Gemfile": "bundle install",
+}
+
+# Which manifest each install command belongs to, so a lockfile-derived command
+# suppresses the weaker manifest-only one for the SAME ecosystem rather than
+# both being printed.
+COMMAND_ECOSYSTEM = {
+    "pip": "python", "uv": "python", "poetry": "python",
+    "npm": "node", "pnpm": "node", "yarn": "node", "bun": "node",
+    "composer": "php", "cargo": "rust", "go": "go", "bundle": "ruby",
+}
+
 
 def reinstall_command(survey: dict, dest_dir: str) -> str:
     """The command to run on the destination, or "" if nothing obvious."""
@@ -1297,6 +1320,17 @@ def reinstall_command(survey: dict, dest_dir: str) -> str:
     # of it, so suggesting both would install the same thing twice.
     if any(lock in present for lock in PYTHON_LOCKS):
         parts = [p for p in parts if not p.startswith("pip install")]
+
+    # A manifest that brought no lockfile still needs SOMETHING printed, or the
+    # destination is left with a skipped dependency tree and no way to rebuild
+    # it. Only for ecosystems a lockfile has not already covered.
+    covered = {COMMAND_ECOSYSTEM.get(p.split()[0]) for p in parts}
+    for manifest in survey.get("manifests", ()):
+        command = MANIFEST_COMMANDS.get(manifest)
+        if command and COMMAND_ECOSYSTEM.get(command.split()[0]) not in covered:
+            parts.append(command)
+            covered.add(COMMAND_ECOSYSTEM.get(command.split()[0]))
+
     if not parts:
         return ""
     return f"cd {shlex.quote(dest_dir)} && " + " && ".join(parts)

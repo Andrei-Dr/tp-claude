@@ -377,3 +377,31 @@ def test_a_richer_python_lockfile_wins_over_requirements_txt(tpc):
             {"locks": [lock, "requirements.txt"], "manager": None}, "/dest")
         assert expected in cmd
         assert "pip install" not in cmd
+
+
+def test_a_manifest_without_a_lockfile_still_gets_a_command(tpc):
+    """A lockless pyproject.toml still has an install command.
+
+    The table is keyed on lockfiles because those pin versions, but skipping a
+    .venv and then printing nothing leaves the destination with no way to
+    rebuild it. The warning already says the versions are unpinned."""
+    survey = {"locks": [], "manifests": ["pyproject.toml"], "manager": None}
+    assert "pip install -e ." in tpc.reinstall_command(survey, "/dest")
+
+
+def test_a_lockfile_is_preferred_over_the_bare_manifest(tpc):
+    """When a lockfile is there it pins the tree, so it wins outright."""
+    cmd = tpc.reinstall_command(
+        {"locks": ["uv.lock"], "manifests": ["pyproject.toml"],
+         "manager": None}, "/dest")
+    assert cmd.endswith("uv sync")
+
+
+def test_a_bare_package_json_still_gets_a_command(tpc):
+    survey = {"locks": [], "manifests": ["package.json"], "manager": None}
+    assert "npm install" in tpc.reinstall_command(survey, "/dest")
+
+
+def test_no_manifest_and_no_lock_yields_nothing(tpc):
+    assert tpc.reinstall_command(
+        {"locks": [], "manifests": [], "manager": None}, "/dest") == ""
