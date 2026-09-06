@@ -262,7 +262,14 @@ Measured on real projects across several stacks:
 | Rust + React (Cargo, npm) | 2.6 GB / 23,722 files | 33 MB / 1,529 files |
 | Go + React + Python ETL | 3.8 GB / 89,399 files | 767 MB / 28,530 files |
 | Laravel + npm (Composer) | 2.6 GB / 139,098 files | 1.2 GB / 6,446 files |
+| Python + ML weights (`.venv`) | 1.7 GB / 54,634 files | 182 MB / 183 files |
+| Python package (`pyproject.toml`) | 132 MB / 4,298 files | 2.5 MB / 489 files |
 | Go CLI, nothing installed | 19.4 MB / 213 files | 19.4 MB / 210 files |
+
+Most of what survives in the ML row is model weights — `.pt`, `.onnx`,
+`.safetensors` files sitting beside the code. Nothing skips those: a virtualenv
+is rebuilt by `pip`, but a downloaded checkpoint is not reproduced by any
+package manager, so it travels.
 
 The last row is the honest case: a repo whose dependencies were never installed
 has nothing to skip, and `--lean` costs it a survey and saves it nothing.
@@ -394,6 +401,11 @@ Ties are resolved rather than duplicated: `packageManager` picks between a
 `pnpm-lock.yaml` and a stray `package-lock.json`, and a `uv.lock` or
 `poetry.lock` suppresses a `requirements.txt` beside it, since that file is
 usually an export of the lockfile rather than a second thing to install.
+
+A manifest that brought no lockfile still gets the install it implies — a bare
+`pyproject.toml` yields `pip install -e .`. That is weaker advice, and the
+preflight says so, but skipping a dependency tree and then printing no way to
+rebuild it would be worse.
 
 It is printed and never run. Reinstalling is a long, network-bound build that
 can fail on its own terms, and making it a side effect of a sync would leave a

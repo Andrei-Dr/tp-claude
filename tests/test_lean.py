@@ -405,3 +405,16 @@ def test_a_bare_package_json_still_gets_a_command(tpc):
 def test_no_manifest_and_no_lock_yields_nothing(tpc):
     assert tpc.reinstall_command(
         {"locks": [], "manifests": [], "manager": None}, "/dest") == ""
+
+
+def test_never_adopts_a_backups_directory(tpc):
+    """A real .gitignore lists `backups/` and `*.sql.gz` beside `dist/`.
+
+    Database dumps are irreplaceable and a glob names files rather than a
+    directory, so neither is adopted while the build output beside them is.
+    """
+    text = ("node_modules/\ndist/\ndist-test/\n"
+            "backups/\n*.sql.gz\n.env\n")
+    adopted, _ = tpc.gitignore_skips(text, {"node_modules/"})
+    assert "/dist/" in adopted and "/dist-test/" in adopted
+    assert not any("backup" in a or "sql" in a or "env" in a for a in adopted)
