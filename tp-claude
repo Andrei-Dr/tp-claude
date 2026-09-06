@@ -1066,10 +1066,12 @@ def gitignore_skips(text: str, already: set) -> tuple[list, list]:
         if not entry or entry.startswith("#"):
             continue
         if entry.startswith("!"):
-            # A negation re-includes something; adopting the broader pattern
-            # above it would invert what the file asks for, so both are
-            # dropped.
-            negated.add(entry[1:].strip().rstrip("/").split("/")[0])
+            # A negation re-includes something. It only bears on an entry it
+            # re-includes IN FULL: git cannot resurrect a file underneath an
+            # excluded directory, so `!dist/keep.js` beneath `dist/` is a no-op
+            # in git and must stay one here -- treating it as meaningful would
+            # silently drop a legitimate exclusion.
+            negated.add(entry[1:].strip().strip("/"))
             continue
         if _looks_secret(entry) or not _looks_derived(entry):
             continue
@@ -1091,9 +1093,7 @@ def gitignore_skips(text: str, already: set) -> tuple[list, list]:
         adopted.append(pattern)
         reasons.append(f"{entry}  (.gitignore)")
 
-    keep = [i for i, p in enumerate(adopted)
-            if p.rstrip("/").split("/")[-1] not in negated
-            and p.strip("/").split("/")[0] not in negated]
+    keep = [i for i, p in enumerate(adopted) if p.strip("/") not in negated]
     return [adopted[i] for i in keep], [reasons[i] for i in keep]
 
 

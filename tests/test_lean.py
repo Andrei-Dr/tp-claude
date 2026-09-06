@@ -303,3 +303,22 @@ def test_does_not_adopt_a_name_that_merely_mentions_a_derived_word(tpc):
                   "/cache-invalidation-docs", "/notes_on_build"):
         adopted, _ = tpc.gitignore_skips(entry + "\n", set())
         assert adopted == [], entry
+
+
+def test_a_negation_of_the_entry_itself_suppresses_it(tpc):
+    """`!dist` re-includes the directory, so the exclusion is dropped."""
+    adopted, _ = tpc.gitignore_skips("/dist\n!dist\n", set())
+    assert adopted == []
+
+
+def test_a_negation_inside_an_excluded_directory_is_a_no_op(tpc):
+    """git cannot re-include a file under an excluded directory, so
+    `!dist/x.txt` changes nothing and `/dist` stays adopted. Treating it as
+    meaningful silently dropped a legitimate exclusion."""
+    adopted, _ = tpc.gitignore_skips("/dist\n!dist/x.txt\n", set())
+    assert adopted == ["/dist/"]
+
+
+def test_an_unrelated_negation_does_not_suppress(tpc):
+    adopted, _ = tpc.gitignore_skips("/build\n!some/other/keep\n", set())
+    assert adopted == ["/build/"]
