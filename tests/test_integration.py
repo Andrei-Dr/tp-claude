@@ -523,3 +523,157 @@ def test_symlinked_dest_that_does_not_exist_yet(world, tmp_path):
 
     assert (real / world.src.name / "main.py").exists()
     assert world.project_dir(real / world.src.name).exists()
+
+
+# --- --lean -----------------------------------------------------------------
+#
+# Real transfers between real directories, because the thing being tested is
+# whether rsync ends up skipping what it was told to skip -- and rsync's
+# pattern semantics (anchored vs not) are exactly the part worth proving rather
+# than assuming.
+
+@pytest.fixture
+def node_world(world):
+    """A workspace whose derived directories mirror a real pnpm monorepo."""
+    (world.src / "package.json").write_text(
+        '{"name":"app","packageManager":"pnpm@9.15.4"}')
+    (world.src / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n")
+    for rel in ("node_modules/left-pad/index.js",
+                "packages/ui/node_modules/dep/index.js",
+                ".turbo/cache/blob",
+                "apps/web/.next/static/chunk.js",
+                "dist/bundle.js",
+                "src/index.ts",
+                "packages/ui/button.tsx"):
+        target = world.src / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("x")
+    return world
+
+
+def test_lean_skips_dependencies_and_build_output(node_world):
+    node_world.run("--lean", node_world.src, f"{node_world.dest_parent}/")
+    landed = node_world.landed
+    assert not (landed / "node_modules").exists()
+    assert not (landed / "packages/ui/node_modules").exists()
+    assert not (landed / ".turbo").exists()
+    assert not (landed / "apps/web/.next").exists()
+    assert not (landed / "dist").exists()
+
+
+def test_lean_keeps_the_source(node_world):
+    """Everything that is not derived still has to arrive."""
+    node_world.run("--lean", node_world.src, f"{node_world.dest_parent}/")
+    landed = node_world.landed
+    assert (landed / "src/index.ts").exists()
+    assert (landed / "packages/ui/button.tsx").exists()
+    assert (landed / "package.json").exists()
+    assert (landed / "pnpm-lock.yaml").exists()
+
+
+def test_without_lean_nothing_is_skipped(node_world):
+    """The default is unchanged: --lean is opt-in."""
+    node_world.run(node_world.src, f"{node_world.dest_parent}/")
+    assert (node_world.landed / "node_modules/left-pad/index.js").exists()
+    assert (node_world.landed / ".turbo/cache/blob").exists()
+
+
+def test_lean_reports_the_reinstall_command(node_world):
+    out = node_world.run("--lean", node_world.src,
+                         f"{node_world.dest_parent}/").stdout
+    assert "pnpm install" in out
+    assert str(node_world.landed) in out
+
+
+def test_no_vendors_is_an_alias_for_lean(node_world):
+    node_world.run("--no-vendors", node_world.src,
+                   f"{node_world.dest_parent}/")
+    assert not (node_world.landed / "node_modules").exists()
+
+
+def test_lean_leaves_a_hand_written_vendor_alone(world):
+    """No composer.json or go.mod, so `vendor/` is somebody's source."""
+    (world.src / "vendor" / "mine").mkdir(parents=True)
+    (world.src / "vendor" / "mine" / "code.py").write_text("mine\n")
+    world.run("--lean", world.src, f"{world.dest_parent}/")
+    assert (world.landed / "vendor" / "mine" / "code.py").exists()
+
+
+def test_lean_skips_composer_vendor(world):
+    (world.src / "composer.json").write_text('{"name":"a/b"}')
+    (world.src / "composer.lock").write_text("{}")
+    (world.src / "vendor" / "pkg").mkdir(parents=True)
+    (world.src / "vendor" / "pkg" / "f.php").write_text("<?php\n")
+    world.run("--lean", world.src, f"{world.dest_parent}/")
+    assert not (world.landed / "vendor").exists()
+    assert (world.landed / "composer.lock").exists()
+
+
+def test_lean_spares_laravel_user_uploads(world):
+    """storage/logs is derived; storage/app is uploads nothing can rebuild."""
+    (world.src / "composer.json").write_text('{"name":"a/b"}')
+    (world.src / "composer.lock").write_text("{}")
+    (world.src / "artisan").write_text("#!/usr/bin/env php\n")
+    for rel in ("storage/logs/laravel.log", "storage/framework/views/x.php",
+                "storage/app/uploads/photo.jpg"):
+        target = world.src / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("x")
+    world.run("--lean", world.src, f"{world.dest_parent}/")
+    assert (world.landed / "storage/app/uploads/photo.jpg").exists()
+    assert not (world.landed / "storage/logs").exists()
+    assert not (world.landed / "storage/framework").exists()
+
+
+def test_lean_warns_about_a_dep_it_cannot_rebuild(world):
+    (world.src / "package.json").write_text(
+        '{"dependencies":{"@a/icons":"file:../outside/icons"}}')
+    (world.src / "package-lock.json").write_text("{}")
+    (world.src / "node_modules").mkdir()
+    out = world.run("--lean", world.src, f"{world.dest_parent}/").stdout
+    assert "@a/icons" in out
+    assert "outside the synced tree" in out
+
+
+def test_lean_proceeds_despite_warnings(world):
+    """Reporting, not refusing -- the transfer still completes."""
+    (world.src / "package.json").write_text(
+        '{"dependencies":{"@a/i":"file:../nope"}}')
+    result = world.run("--lean", world.src, f"{world.dest_parent}/")
+    assert result.returncode == 0
+    assert (world.landed / "main.py").exists()
+
+
+def test_exclude_takes_extra_patterns(world):
+    (world.src / "secrets").mkdir()
+    (world.src / "secrets" / "k.pem").write_text("k\n")
+    world.run("--exclude", "secrets/", world.src, f"{world.dest_parent}/")
+    assert not (world.landed / "secrets").exists()
+    assert (world.landed / "main.py").exists()
+
+
+def test_no_worktrees_is_independent_of_lean(world):
+    """Agent worktrees are machine-local, but they are not build output."""
+    wt = world.src / ".claude" / "worktrees" / "task-1"
+    wt.mkdir(parents=True)
+    (wt / "f.txt").write_text("scratch\n")
+    (world.src / ".claude" / "settings.local.json").write_text("{}")
+    world.run("--no-worktrees", world.src, f"{world.dest_parent}/")
+    assert not (world.landed / ".claude" / "worktrees").exists()
+    assert (world.landed / ".claude" / "settings.local.json").exists()
+
+
+def test_lean_does_not_touch_sessions(node_world):
+    """--lean is about the code tree; the transcripts still travel in full."""
+    node_world.seed_session()
+    node_world.run("--lean", node_world.src, f"{node_world.dest_parent}/")
+    proj = node_world.project_dir(node_world.landed)
+    assert (proj / "session.jsonl").exists()
+    assert (proj / "memory" / "MEMORY.md").exists()
+
+
+def test_dry_run_lean_reports_without_copying(node_world):
+    out = node_world.run("--lean", "--dry-run", node_world.src,
+                         f"{node_world.dest_parent}/").stdout
+    assert "dry run" in out
+    assert not node_world.landed.exists()
