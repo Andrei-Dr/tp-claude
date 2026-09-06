@@ -225,6 +225,13 @@ LEAN_RULES = (
              "virtualenvs and bytecode"),
     LeanRule("ruby", ("Gemfile",), (".bundle/", "/vendor/bundle/"),
              "bundled gems"),
+    # Rails' own regenerable directories. Gated on config/application.rb --
+    # a Gemfile alone is any Ruby project, and the layout below is Rails'.
+    # public/assets is deliberately absent: Rails compiles into it, but other
+    # stacks keep real assets there, and dropping those is unrecoverable.
+    LeanRule("rails", ("config/application.rb",),
+             ("/tmp/cache/", "/tmp/pids/", "/tmp/sockets/", "/log/"),
+             "Rails caches and logs"),
     # Framework caches keyed to the machine that built them.
     LeanRule("laravel", ("artisan",),
              ("/bootstrap/cache/", "/storage/framework/", "/storage/logs/"),
@@ -232,7 +239,7 @@ LEAN_RULES = (
     # Build output. Gated on a manifest so a `dist/` of hand-written files in a
     # plain directory is never mistaken for something a build produced.
     LeanRule("build", ("package.json", "Cargo.toml", "go.mod",
-                       "composer.json", "pyproject.toml"),
+                       "composer.json", "pyproject.toml", "Gemfile"),
              (".turbo/", ".next/", ".nuxt/", ".svelte-kit/", ".parcel-cache/",
               "/dist/", "/build/", "/out/"),
              "build output"),
@@ -283,6 +290,10 @@ def rule_patterns(rules) -> list:
 MANIFEST_FILES = ("package.json", "composer.json", "go.mod", "Cargo.toml",
                   "pyproject.toml", "requirements.txt", "setup.py", "Pipfile",
                   "setup.cfg", "Gemfile", "artisan")
+
+# Markers identified by a PATH rather than a bare filename, because the
+# basename alone is too common to be evidence of anything.
+PATH_MARKERS = ("config/application.rb",)
 
 # A manifest is only a promise that something CAN be reinstalled; the lockfile
 # is what pins it to the same versions. Each manifest names the lockfiles that
@@ -1124,6 +1135,15 @@ def local_survey(root: str) -> dict:
             ignored = handle.read()
     except OSError:
         ignored = ""
+    # Markers that are a PATH rather than a bare filename, so the basename
+    # walk above cannot find them. Checked directly: a bare application.rb is
+    # a common enough filename that matching on the basename would fire the
+    # Rails rule for projects that are not Rails.
+    path_markers = []
+    for marker in PATH_MARKERS:
+        if os.path.isfile(os.path.join(root, marker)):
+            path_markers.append(marker)
+
     # Where each manifest lives, relative to the root. A transfer whose source
     # is a parent of several projects (tp-claude ~/dev/ ...) has to anchor each
     # project's rules to that project rather than to the transfer root.
@@ -1132,7 +1152,15 @@ def local_survey(root: str) -> dict:
         rel = os.path.relpath(os.path.dirname(manifest), root)
         homes.setdefault(os.path.basename(manifest), []).append(
             "" if rel == "." else rel)
-    return {"manifests": sorted({os.path.basename(m) for m in manifests}),
+    # A path marker is named by its path, not its basename: `application.rb`
+    # is a common filename, and keying on it would fire the rule that needs it
+    # for projects that merely happen to contain one. Its home is the root,
+    # since the pattern it gates is written relative to the project.
+    for marker in path_markers:
+        homes.setdefault(marker, []).append("")
+
+    return {"manifests": sorted({os.path.basename(m) for m in manifests}
+                                | set(path_markers)),
             "manifest_homes": {k: sorted(set(v)) for k, v in homes.items()},
             "locks": sorted(locks),
             "manager": report.manager,

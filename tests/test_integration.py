@@ -804,3 +804,29 @@ def test_lean_keeps_a_live_sqlite_database(world):
         assert (world.landed / ".data" / name).exists(), name
     assert (world.landed / ".env").exists()
     assert not (world.landed / "dist").exists()
+
+
+def test_lean_on_a_rails_app(world):
+    """Bundled gems and Rails' own caches go; a hand-written vendor/ and
+    public/assets stay. public/assets is compiled output in Rails and real
+    source elsewhere, so it is left alone the way storage/app is."""
+    (world.src / "Gemfile").write_text('source "https://rubygems.org"\n')
+    (world.src / "Gemfile.lock").write_text("GEM\n")
+    (world.src / "config").mkdir()
+    (world.src / "config" / "application.rb").write_text("module App; end\n")
+    for rel in ("vendor/bundle/ruby/gem.rb", ".bundle/config",
+                "tmp/cache/x", "log/development.log",
+                "app/models/user.rb", "vendor/mygem/lib.rb",
+                "public/assets/app-abc.js"):
+        target = world.src / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("x\n")
+    out = world.run("--lean", world.src, f"{world.dest_parent}/").stdout
+    assert not (world.landed / "vendor" / "bundle").exists()
+    assert not (world.landed / ".bundle").exists()
+    assert not (world.landed / "tmp" / "cache").exists()
+    assert not (world.landed / "log").exists()
+    assert (world.landed / "app" / "models" / "user.rb").exists()
+    assert (world.landed / "vendor" / "mygem" / "lib.rb").exists()
+    assert (world.landed / "public" / "assets" / "app-abc.js").exists()
+    assert "bundle install" in out

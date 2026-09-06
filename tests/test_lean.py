@@ -478,3 +478,60 @@ def test_verbose_prints_every_exclude(tpc):
     line = tpc.format_rsync_command(["rsync", *opts, "s/", "d/"])
     assert "excludes]" not in line
     assert "--exclude=/p29/dist/" in line
+
+
+# --- ruby -------------------------------------------------------------------
+#
+# The rule table advertises a `ruby` rule, so it gets the same coverage as the
+# ecosystems above rather than being taken on trust.
+
+def test_ruby_rule_needs_a_gemfile(tpc):
+    assert ".bundle/" in tpc.rule_patterns(tpc.lean_rules({"Gemfile"}))
+    assert ".bundle/" not in tpc.rule_patterns(tpc.lean_rules({"package.json"}))
+
+
+def test_a_gemfile_enables_the_build_rule(tpc):
+    """Every other manifest enables `build`; Gemfile was left out, so a Ruby
+    project's dist/ and build/ were never skipped."""
+    assert "build" in [r.name for r in tpc.lean_rules({"Gemfile"})]
+
+
+def test_bundler_vendor_path_is_scoped_not_bare(tpc):
+    """Bundler installs into vendor/bundle. The pattern names that path rather
+    than `vendor/`, so a Ruby project's hand-written vendor/ survives when no
+    composer.json or go.mod proves the whole directory derived."""
+    pats = tpc.rule_patterns(tpc.lean_rules({"Gemfile"}))
+    assert "/vendor/bundle/" in pats
+    assert "/vendor/" not in pats
+
+
+def test_ruby_reinstall_command(tpc):
+    for locks in ([], ["Gemfile.lock"]):
+        cmd = tpc.reinstall_command(
+            {"locks": locks, "manifests": ["Gemfile"], "manager": None},
+            "/dest")
+        assert cmd.endswith("bundle install"), locks
+
+
+def test_rails_rule_needs_more_than_a_gemfile(tpc):
+    """A Gemfile alone is any Ruby project; config/application.rb is what says
+    the tmp/ and log/ layout below actually applies."""
+    pats = tpc.rule_patterns(tpc.lean_rules({"Gemfile", "config/application.rb"}))
+    assert "/tmp/cache/" in pats and "/log/" in pats
+    assert "/log/" not in tpc.rule_patterns(tpc.lean_rules({"Gemfile"}))
+
+
+def test_rails_rule_spares_public_assets(tpc):
+    """Rails compiles into public/assets, but other stacks keep real assets
+    there -- one repo in the wild has 196 MB of source under that path. Same
+    reasoning as storage/app: under-skipping costs bandwidth, over-skipping
+    costs data."""
+    pats = tpc.rule_patterns(tpc.lean_rules({"Gemfile", "config/application.rb"}))
+    assert not any("public" in p for p in pats)
+
+
+def test_rails_rule_does_not_skip_all_of_tmp(tpc):
+    """tmp/ can hold uploads mid-processing; only the known-derived children
+    are named."""
+    pats = tpc.rule_patterns(tpc.lean_rules({"Gemfile", "config/application.rb"}))
+    assert "/tmp/" not in pats
