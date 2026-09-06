@@ -1270,7 +1270,14 @@ INSTALL_COMMANDS = (
     ("poetry.lock", "poetry install"),
     ("uv.lock", "uv sync"),
     ("go.sum", "go mod download"),
+    # Last: a requirements.txt beside a uv/poetry lockfile is usually an export
+    # of it, so the richer tool wins and this is dropped (see below).
+    ("requirements.txt", "pip install -r requirements.txt"),
 )
+
+# A lockfile that pins the whole dependency tree, making a requirements.txt
+# sitting beside it redundant rather than a second thing to install.
+PYTHON_LOCKS = ("uv.lock", "poetry.lock", "Pipfile.lock", "pdm.lock")
 
 
 def reinstall_command(survey: dict, dest_dir: str) -> str:
@@ -1286,6 +1293,10 @@ def reinstall_command(survey: dict, dest_dir: str) -> str:
         if preferred:
             parts = preferred + [p for p in parts
                                  if not p.split()[0] in node_managers]
+    # uv/poetry pin the whole tree; a requirements.txt beside one is an export
+    # of it, so suggesting both would install the same thing twice.
+    if any(lock in present for lock in PYTHON_LOCKS):
+        parts = [p for p in parts if not p.startswith("pip install")]
     if not parts:
         return ""
     return f"cd {shlex.quote(dest_dir)} && " + " && ".join(parts)

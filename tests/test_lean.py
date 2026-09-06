@@ -357,3 +357,23 @@ def test_manifest_search_never_descends_into_a_dependency_tree(tpc, tmp_path):
     assert len(found) == 1
     assert found[0].endswith("/package.json")
     assert "node_modules" not in found[0] and "vendor" not in found[0]
+
+
+def test_requirements_txt_gets_a_reinstall_command(tpc):
+    """A plain pip project has its .venv skipped, so it needs the command that
+    rebuilds it. requirements.txt was a detection manifest with no entry in the
+    install table, which left those projects with nothing printed."""
+    survey = {"locks": ["requirements.txt"], "manager": None}
+    assert "pip install" in tpc.reinstall_command(survey, "/dest")
+    assert "requirements.txt" in tpc.reinstall_command(survey, "/dest")
+
+
+def test_a_richer_python_lockfile_wins_over_requirements_txt(tpc):
+    """uv/poetry pin the whole tree; a requirements.txt beside one is usually
+    an export of it, so suggesting both would be redundant."""
+    for lock, expected in (("uv.lock", "uv sync"),
+                           ("poetry.lock", "poetry install")):
+        cmd = tpc.reinstall_command(
+            {"locks": [lock, "requirements.txt"], "manager": None}, "/dest")
+        assert expected in cmd
+        assert "pip install" not in cmd
