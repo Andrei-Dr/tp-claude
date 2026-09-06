@@ -322,3 +322,38 @@ def test_a_negation_inside_an_excluded_directory_is_a_no_op(tpc):
 def test_an_unrelated_negation_does_not_suppress(tpc):
     adopted, _ = tpc.gitignore_skips("/build\n!some/other/keep\n", set())
     assert adopted == ["/build/"]
+
+
+def test_manifest_search_reaches_nested_workspace_packages(tpc, tmp_path):
+    """The depth bound has to clear a real monorepo's nesting.
+
+    `apps/web/package.json` is two levels down and must be found; the bound
+    exists only to stop the walk before it wanders into a dependency tree, and
+    the skip set does the real pruning.
+    """
+    for rel in ("package.json", "apps/web/package.json",
+                "packages/db/composer.json",
+                "a/b/c/d/e/package.json"):          # past the bound
+        target = tmp_path / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("{}")
+    found = {str(p)[len(str(tmp_path)) + 1:] for p in
+             map(__import__("pathlib").Path, tpc._find_manifests(str(tmp_path)))}
+    assert "package.json" in found
+    assert "apps/web/package.json" in found
+    assert "packages/db/composer.json" in found
+    assert "a/b/c/d/e/package.json" not in found
+
+
+def test_manifest_search_never_descends_into_a_dependency_tree(tpc, tmp_path):
+    """The tree usually still HAS its node_modules; walking in would find
+    thousands of manifests belonging to packages rather than the project."""
+    for rel in ("package.json", "node_modules/left-pad/package.json",
+                "vendor/acme/composer.json", ".git/x/package.json"):
+        target = tmp_path / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("{}")
+    found = tpc._find_manifests(str(tmp_path))
+    assert len(found) == 1
+    assert found[0].endswith("/package.json")
+    assert "node_modules" not in found[0] and "vendor" not in found[0]

@@ -322,6 +322,11 @@ def _find_manifests(root: str, max_depth: int = 3) -> list:
     Bounded in depth and pruned of dependency directories because the tree
     being examined usually still HAS its node_modules -- walking into it would
     find thousands of manifests belonging to packages, not to the project.
+
+    `max_depth` counts directory names below `root`, so the default reaches
+    a/b/c but not a/b/c/d -- comfortably past a monorepo's apps/web while
+    stopping well short of a dependency tree. The skip set below does the real
+    pruning; the bound is just a backstop.
     """
     skip = {"node_modules", "vendor", ".git", "target", ".venv", "venv",
             ".turbo", ".next", "dist", "build", "__pycache__", ".cache"}
