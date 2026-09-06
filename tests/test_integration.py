@@ -677,3 +677,28 @@ def test_dry_run_lean_reports_without_copying(node_world):
                          f"{node_world.dest_parent}/").stdout
     assert "dry run" in out
     assert not node_world.landed.exists()
+
+
+def test_lean_adopts_a_gitignored_build_dir(world):
+    """The project's own .gitignore names build dirs no rule knows about."""
+    (world.src / "package.json").write_text('{"name":"a"}')
+    (world.src / "package-lock.json").write_text("{}")
+    (world.src / ".gitignore").write_text("/public/build\n.env\n")
+    for rel in ("public/build/app.js", "public/index.html"):
+        target = world.src / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("x")
+    out = world.run("--lean", world.src, f"{world.dest_parent}/").stdout
+    assert not (world.landed / "public/build").exists()
+    assert (world.landed / "public/index.html").exists()
+    assert "/public/build" in out          # never a silent skip
+
+
+def test_lean_never_drops_dotenv(world):
+    """.gitignore lists .env; the destination cannot run without it."""
+    (world.src / ".gitignore").write_text(".env\n.env.local\n/dist\n")
+    (world.src / ".env").write_text("SECRET=1\n")
+    (world.src / ".env.local").write_text("SECRET=2\n")
+    world.run("--lean", world.src, f"{world.dest_parent}/")
+    assert (world.landed / ".env").read_text() == "SECRET=1\n"
+    assert (world.landed / ".env.local").exists()

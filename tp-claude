@@ -955,6 +955,104 @@ def effective_landing(src: Endpoint, dest: Endpoint) -> tuple[str, str]:
     return src_dir, dest_dir
 
 
+# --- .gitignore as a corroborating signal -----------------------------------
+#
+# A .gitignore is tempting to read as "the list of things not worth sending",
+# and it is not. It answers a different question -- "should git track this?" --
+# whose answer covers three kinds of file:
+#
+#   derived    /public/build, /public/css, .turbo   -> safe to skip
+#   secrets    .env, *.key, .mcp.json, credentials  -> MUST travel; the
+#              destination cannot run without them and nothing regenerates them
+#   local data uploads, generated assets, caches of                    real work
+#              -> unrecoverable if dropped
+#
+# Honoring the file wholesale would quietly drop the second and third groups.
+# So an entry is adopted only when it independently looks derived, which lets
+# .gitignore contribute the project-specific build directories a generic
+# ruleset cannot know about, and nothing else. Everything adopted is printed,
+# so a skip is never silent.
+
+# Names that mean "produced by a tool" wherever they appear.
+DERIVED_WORDS = ("build", "dist", "cache", "caches", "tmp", "temp", "out",
+                 "output", "coverage", "generated", "artifacts", "logs",
+                 "node_modules", "vendor", "target", "bin", "obj", "min",
+                 "compiled", "bundle", "assets-build", "public-build")
+
+# Anything that smells like a credential is never adopted, however derived the
+# rest of the name looks. Checked first and independently for that reason.
+SECRET_WORDS = ("env", "secret", "secrets", "credential", "credentials",
+                "key", "keys", "token", "tokens", "password", "passwords",
+                "auth", "id_rsa", "id_ed25519", "pem", "p12", "pfx",
+                "keystore", "htpasswd", "netrc", "npmrc", "pypirc", "mcp")
+
+
+def _looks_secret(entry: str) -> bool:
+    """True if the entry could name a credential.
+
+    Deliberately trigger-happy: a false positive costs one directory that was
+    not skipped, while a false negative leaks a secret out of the transfer and
+    leaves the destination unable to start.
+    """
+    lowered = entry.lower().strip("/*!")
+    for chunk in re.split(r"[/._*\-]+", lowered):
+        if chunk in SECRET_WORDS:
+            return True
+    return False
+
+
+def _looks_derived(entry: str) -> bool:
+    """True if the entry's own name says a tool produced it."""
+    lowered = entry.lower().rstrip("/")
+    tail = lowered.rsplit("/", 1)[-1]
+    for chunk in re.split(r"[._\-]+", tail):
+        if chunk in DERIVED_WORDS:
+            return True
+    return False
+
+
+def gitignore_skips(text: str, already: set) -> tuple[list, list]:
+    """Entries from a .gitignore worth adopting as excludes.
+
+    Returns (patterns, human-readable reasons). `already` is what the rules
+    cover, so the same directory is not listed twice.
+    """
+    adopted, reasons, negated = [], [], set()
+
+    for raw in text.splitlines():
+        entry = raw.strip()
+        if not entry or entry.startswith("#"):
+            continue
+        if entry.startswith("!"):
+            # A negation re-includes something; adopting the broader pattern
+            # above it would invert what the file asks for, so both are
+            # dropped.
+            negated.add(entry[1:].strip().rstrip("/").split("/")[0])
+            continue
+        if _looks_secret(entry) or not _looks_derived(entry):
+            continue
+        # Only whole directories. A glob like *.log names files scattered
+        # through the tree, and excluding those is the kind of surprise this
+        # feature is trying to avoid.
+        if any(ch in entry for ch in "*?[]"):
+            continue
+        # A trailing '/' in rsync means "directories only", so adding one to an
+        # entry that names a file makes the pattern silently miss it
+        # (.phpunit.result.cache is a file, not a directory). Only keep the
+        # slash the .gitignore itself wrote, which is where it means the same
+        # thing in both formats.
+        pattern = entry
+        if pattern in already or f"{pattern}/" in already or pattern in adopted:
+            continue
+        adopted.append(pattern)
+        reasons.append(f"{entry}  (.gitignore)")
+
+    keep = [i for i, p in enumerate(adopted)
+            if p.rstrip("/").split("/")[-1] not in negated
+            and p.strip("/").split("/")[0] not in negated]
+    return [adopted[i] for i in keep], [reasons[i] for i in keep]
+
+
 def local_survey(root: str) -> dict:
     """Manifests, lockfiles and reinstall risks for a tree on this machine."""
     root = root.rstrip("/")
@@ -966,10 +1064,17 @@ def local_survey(root: str) -> dict:
                 if os.path.exists(os.path.join(base, name)):
                     locks.add(name)
     report = reconstructability(root)
+    try:
+        with open(os.path.join(root, ".gitignore"),
+                  encoding="utf-8", errors="replace") as handle:
+            ignored = handle.read()
+    except OSError:
+        ignored = ""
     return {"manifests": sorted({os.path.basename(m) for m in manifests}),
             "locks": sorted(locks),
             "manager": report.manager,
-            "warnings": report.warnings}
+            "warnings": report.warnings,
+            "gitignore": ignored}
 
 
 # The same survey, run on a remote source. Rather than keeping a second copy of
@@ -1033,10 +1138,19 @@ def plan_skips(src: Endpoint, src_dir: str, dest_dir: str,
         patterns = rule_patterns(rules)
         skips += [anchor(p) for p in patterns]
 
-        if patterns:
+        # The project's own .gitignore can name build directories no generic
+        # rule knows about. Only its unambiguously-derived entries are taken --
+        # never a secret, never anything whose name does not say a tool made it.
+        extra, adopted_why = gitignore_skips(survey.get("gitignore", ""),
+                                             set(patterns))
+        skips += [anchor(p) for p in extra]
+
+        if patterns or extra:
             print(">> [0/4] skipping rebuildable directories ...")
             for rule in rules:
                 print(f"   {rule.name:<8} {rule.why}")
+            for why in adopted_why:
+                print(f"   {'gitignore':<8} {why}")
             warnings = survey["warnings"]
             if warnings:
                 print()

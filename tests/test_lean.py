@@ -134,3 +134,101 @@ def test_venv_without_any_requirements_warns(tmp_path, tpc):
 def test_clean_repo_reports_nothing(tmp_path, tpc):
     root = _project(tmp_path, {"README.md": "hi"})
     assert tpc.reconstructability(str(root)).warnings == []
+
+
+# --- .gitignore as corroboration -------------------------------------------
+#
+# A .gitignore answers "should git track this?", which is broader than "is this
+# derived?". It also lists secrets (.env) and local data (uploads, generated
+# assets) that must travel. So entries are ADOPTED only when they independently
+# look derived, and everything else is left alone.
+
+def test_adopts_a_derived_looking_entry(tpc):
+    """A build directory this ruleset does not know about by name."""
+    adopted, _ = tpc.gitignore_skips("/public/build\n", set())
+    assert "/public/build" in adopted
+
+
+def test_does_not_adopt_an_ambiguous_entry(tpc):
+    """`/public/css` is build output in one repo and hand-written in another.
+
+    Being in .gitignore is not enough to tell them apart, so it is left alone.
+    Under-skipping costs bandwidth; over-skipping costs someone's source.
+    """
+    adopted, _ = tpc.gitignore_skips("/public/css\n/public/js/all.js\n", set())
+    assert adopted == []
+
+
+def test_never_adopts_dotenv(tpc):
+    """The single most damaging thing to drop: the target needs it."""
+    adopted, _ = tpc.gitignore_skips(".env\n.env.*\n.env.backup\n", set())
+    assert adopted == []
+
+
+def test_never_adopts_credentials_or_keys(tpc):
+    text = ("/storage/*.key\ne2e/.portal-credentials.json\n"
+            ".mcp.json\nid_rsa\nsecrets.json\n*.pem\n")
+    adopted, _ = tpc.gitignore_skips(text, set())
+    assert adopted == []
+
+
+def test_does_not_adopt_unknown_data_directories(tpc):
+    """/public/assets is 196M of real assets in a real repo, not build output.
+
+    Nothing about the name says 'derived', so it is left for the user to
+    exclude by hand rather than guessed at.
+    """
+    adopted, _ = tpc.gitignore_skips("/public/assets\n/public/videos\n", set())
+    assert adopted == []
+
+
+def test_negations_are_respected(tpc):
+    """`!` re-includes; adopting the pattern above it would invert intent."""
+    adopted, _ = tpc.gitignore_skips("dist/\n!dist/keep.js\n", set())
+    assert not any("keep" in a for a in adopted)
+
+
+def test_ignores_comments_and_blanks(tpc):
+    adopted, _ = tpc.gitignore_skips("# a comment\n\n  \n/dist\n", set())
+    assert adopted == ["/dist"]
+
+
+def test_reports_what_it_adopted(tpc):
+    """Never silent: the caller prints these so a skip is always visible."""
+    _, reasons = tpc.gitignore_skips("/public/build\n", set())
+    assert any("/public/build" in r for r in reasons)
+
+
+def test_does_not_duplicate_what_rules_already_cover(tpc):
+    adopted, _ = tpc.gitignore_skips("node_modules/\n/dist/\n",
+                                     {"node_modules/", "/dist/"})
+    assert adopted == []
+
+
+def test_adopts_cache_and_log_directories(tpc):
+    adopted, _ = tpc.gitignore_skips(
+        "/var/cache\n/tmp/build-artifacts\n*.log\n", set())
+    assert "/var/cache" in adopted
+    assert "/tmp/build-artifacts" in adopted
+
+
+def test_does_not_force_a_directory_slash_onto_a_file_entry(tpc):
+    """`foo/` matches only directories, so appending '/' to a file entry makes
+    the pattern silently miss. Real case: .phpunit.result.cache is a file."""
+    adopted, _ = tpc.gitignore_skips(".phpunit.result.cache\n", set())
+    assert ".phpunit.result.cache" in adopted
+    assert ".phpunit.result.cache/" not in adopted
+
+
+def test_an_entry_written_with_a_slash_keeps_it(tpc):
+    """A trailing slash in .gitignore is an explicit 'directory only'."""
+    adopted, _ = tpc.gitignore_skips("/var/cache/\n", set())
+    assert "/var/cache/" in adopted
+
+
+def test_static_cache_rule_matches_cache_files(tpc):
+    """The cache rule names three files; none may carry a directory slash."""
+    pats = tpc.rule_patterns(tpc.lean_rules({"composer.json"}))
+    for name in (".php-cs-fixer.cache", ".phpunit.cache",
+                 ".phpunit.result.cache", ".DS_Store"):
+        assert name in pats and f"{name}/" not in pats
