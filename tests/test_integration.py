@@ -702,3 +702,51 @@ def test_lean_never_drops_dotenv(world):
     world.run("--lean", world.src, f"{world.dest_parent}/")
     assert (world.landed / ".env").read_text() == "SECRET=1\n"
     assert (world.landed / ".env.local").exists()
+
+
+def test_lean_with_delete_does_not_prune_the_excluded_dirs(world):
+    """--delete prunes what the source no longer has, but an excluded
+    directory is not "no longer there" -- it was never offered. rsync protects
+    excludes from deletion (only --delete-excluded would remove them, which is
+    never passed), so a destination that already has node_modules keeps it."""
+    (world.src / "package.json").write_text('{"name":"a"}')
+    (world.src / "package-lock.json").write_text("{}")
+    (world.src / "node_modules" / "pkg").mkdir(parents=True)
+    (world.src / "node_modules" / "pkg" / "index.js").write_text("new\n")
+    world.run(world.src, f"{world.dest_parent}/")          # full transfer
+    assert (world.landed / "node_modules" / "pkg" / "index.js").exists()
+    world.run("--lean", "--delete", world.src, f"{world.dest_parent}/")
+    assert (world.landed / "node_modules" / "pkg" / "index.js").exists()
+
+
+def test_lean_skips_nested_projects_under_a_parent_directory(world):
+    """`tp-claude ~/dev/ host:/home/me/dev/` syncs many projects at once.
+
+    Anchored rules exist so `resources/vendor/` is not mistaken for Composer's,
+    but anchoring them to the TRANSFER root makes them miss every project below
+    it -- /target/ would mean dev/target rather than dev/app/target. They have
+    to be anchored to the project that proves them instead.
+    """
+    parent = world.src.parent / "many"
+    for name, manifest, derived in (
+            ("appA", "package.json", "node_modules/x/i.js"),
+            ("appB", "Cargo.toml", "target/debug/bin"),
+            ("appC", "composer.json", "vendor/pkg/f.php")):
+        (parent / name).mkdir(parents=True)
+        (parent / name / manifest).write_text("{}")
+        target = parent / name / derived
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("derived\n")
+        (parent / name / "src.txt").write_text("source\n")
+    # A hand-written vendor/ in a project with no PHP manifest still survives.
+    (parent / "appB" / "vendor" / "mine").mkdir(parents=True)
+    (parent / "appB" / "vendor" / "mine" / "code.rs").write_text("mine\n")
+
+    out = world.dest_parent / "many"
+    world.run("--lean", f"{parent}/", f"{out}/")
+    assert not (out / "appA" / "node_modules").exists()
+    assert not (out / "appB" / "target").exists()
+    assert not (out / "appC" / "vendor").exists()
+    assert (out / "appB" / "vendor" / "mine" / "code.rs").exists()
+    for name in ("appA", "appB", "appC"):
+        assert (out / name / "src.txt").exists()

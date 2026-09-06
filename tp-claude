@@ -1079,7 +1079,16 @@ def local_survey(root: str) -> dict:
             ignored = handle.read()
     except OSError:
         ignored = ""
+    # Where each manifest lives, relative to the root. A transfer whose source
+    # is a parent of several projects (tp-claude ~/dev/ ...) has to anchor each
+    # project's rules to that project rather than to the transfer root.
+    homes = {}
+    for manifest in manifests:
+        rel = os.path.relpath(os.path.dirname(manifest), root)
+        homes.setdefault(os.path.basename(manifest), []).append(
+            "" if rel == "." else rel)
     return {"manifests": sorted({os.path.basename(m) for m in manifests}),
+            "manifest_homes": {k: sorted(set(v)) for k, v in homes.items()},
             "locks": sorted(locks),
             "manager": report.manager,
             "warnings": report.warnings,
@@ -1124,35 +1133,60 @@ def plan_skips(src: Endpoint, src_dir: str, dest_dir: str,
     Returns (rsync options, reinstall command or ""). The scan runs on
     whichever machine holds the source, since that is where the manifests are.
     """
-    # rsync anchors a leading '/' to the TRANSFER root, not to the directory
-    # being sent. Without a trailing slash the transfer root is the parent, so
-    # `/vendor/` would mean the sibling of the project rather than the one
-    # inside it. Same trailing-slash rule effective_landing() applies, for the
-    # same reason.
-    def anchor(pattern: str) -> str:
-        if not pattern.startswith("/") or src.trailing:
-            return pattern
-        return f"/{os.path.basename(src_dir)}{pattern}"
+    # rsync anchors a leading '/' to the TRANSFER root, which is not the same
+    # directory as the project. Two things shift it:
+    #
+    #   * without a trailing slash on SRC the transfer root is SRC's parent, so
+    #     `/vendor/` would name the project's sibling (the same trailing-slash
+    #     rule effective_landing() applies, for the same reason);
+    #   * the source may be a parent of many projects (`tp-claude ~/dev/ ...`),
+    #     where `/target/` means dev/target rather than dev/app/target and would
+    #     silently miss every project below.
+    #
+    # So an anchored pattern is emitted once per directory that proves its
+    # rule. Unanchored patterns (node_modules/) already match at any depth.
+    prefix = "" if src.trailing else f"/{os.path.basename(src_dir)}"
+
+    def anchor(pattern: str, homes=("",)) -> list:
+        if not pattern.startswith("/"):
+            return [pattern]
+        out = []
+        for home in homes:
+            middle = f"/{home}" if home else ""
+            out.append(f"{prefix}{middle}{pattern}")
+        return out
 
     skips: list[str] = list(args.exclude)
     reinstall = ""
 
     if args.no_worktrees:
-        skips += [anchor(p) for p in WORKTREE_PATTERNS]
+        for pattern in WORKTREE_PATTERNS:
+            skips += anchor(pattern)
 
     if args.lean:
         survey = src.survey(src_dir)
+        homes = survey.get("manifest_homes", {})
         rules = [rule for rule in lean_rules(set(survey["manifests"]))
                  if rule.name not in args.disabled_rules]
+
         patterns = rule_patterns(rules)
-        skips += [anchor(p) for p in patterns]
+        for rule in rules:
+            # Anchor to the projects whose manifest proved this rule. A rule
+            # that needs no manifest is anchored at the root.
+            where = sorted({home for need in rule.needs
+                            for home in homes.get(need, [])}) or [""]
+            for pattern in rule.patterns:
+                for expanded in anchor(pattern, where):
+                    if expanded not in skips:
+                        skips.append(expanded)
 
         # The project's own .gitignore can name build directories no generic
         # rule knows about. Only its unambiguously-derived entries are taken --
         # never a secret, never anything whose name does not say a tool made it.
         extra, adopted_why = gitignore_skips(survey.get("gitignore", ""),
                                              set(patterns))
-        skips += [anchor(p) for p in extra]
+        for pattern in extra:
+            skips += anchor(pattern)
 
         if patterns or extra:
             print(">> [0/4] skipping rebuildable directories ...")
