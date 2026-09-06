@@ -259,7 +259,9 @@ Measured on real projects across several stacks:
 | project | default | `--lean` |
 | --- | --- | --- |
 | pnpm monorepo (Next.js, turbo) | 8.3 GB / 113,753 files | 188 MB / 5,969 files |
+| Next.js app (pnpm, drizzle) | 1.7 GB / 60,286 files | 10 MB / 1,224 files |
 | Rust + React (Cargo, npm) | 2.6 GB / 23,722 files | 33 MB / 1,529 files |
+| TS monorepo + SQLite state | 923 MB / 56,645 files | 93 MB / 4,236 files |
 | Go + React + Python ETL | 3.8 GB / 89,399 files | 767 MB / 28,530 files |
 | Laravel + npm (Composer) | 2.6 GB / 139,098 files | 1.2 GB / 6,446 files |
 | Python + ML weights (`.venv`) | 1.7 GB / 54,634 files | 182 MB / 183 files |
@@ -269,7 +271,9 @@ Measured on real projects across several stacks:
 Most of what survives in the ML row is model weights — `.pt`, `.onnx`,
 `.safetensors` files sitting beside the code. Nothing skips those: a virtualenv
 is rebuilt by `pip`, but a downloaded checkpoint is not reproduced by any
-package manager, so it travels.
+package manager, so it travels. The same holds for live state — a SQLite file
+and its WAL under a `.gitignore`d `.data/`, a directory of `.sql.gz` dumps —
+which is why a `.gitignore` is read for corroboration rather than obeyed.
 
 The last row is the honest case: a repo whose dependencies were never installed
 has nothing to skip, and `--lean` costs it a survey and saves it nothing.

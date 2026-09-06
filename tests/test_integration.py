@@ -781,3 +781,26 @@ def test_lean_keeps_downloaded_model_weights(world):
     for name in ("yolo26s.pt", "model.onnx", "weights.safetensors"):
         assert (world.landed / name).exists(), name
     assert "pip install -e ." in out          # lockless pyproject still guided
+
+
+def test_lean_keeps_a_live_sqlite_database(world):
+    """A real .gitignore lists `.data` and `*.db` beside `dist` and `.turbo`.
+
+    The database and its WAL are live state that nothing regenerates, so they
+    travel while the build output around them does not.
+    """
+    (world.src / "package.json").write_text('{"name":"a"}')
+    (world.src / "package-lock.json").write_text("{}")
+    (world.src / ".gitignore").write_text(
+        "node_modules\n.next\ndist\n.env\n.data\n*.db\n.turbo\n")
+    (world.src / ".data").mkdir()
+    for name in ("app.db", "app.db-wal", "app.db-shm"):
+        (world.src / ".data" / name).write_text("sqlite\n")
+    (world.src / ".env").write_text("DATABASE_URL=x\n")
+    (world.src / "dist").mkdir()
+    (world.src / "dist" / "bundle.js").write_text("built\n")
+    world.run("--lean", world.src, f"{world.dest_parent}/")
+    for name in ("app.db", "app.db-wal", "app.db-shm"):
+        assert (world.landed / ".data" / name).exists(), name
+    assert (world.landed / ".env").exists()
+    assert not (world.landed / "dist").exists()
