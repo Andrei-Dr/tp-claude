@@ -418,3 +418,35 @@ def test_never_adopts_a_backups_directory(tpc):
     adopted, _ = tpc.gitignore_skips(text, {"node_modules/"})
     assert "/dist/" in adopted and "/dist-test/" in adopted
     assert not any("backup" in a or "sql" in a or "env" in a for a in adopted)
+
+
+def test_a_command_names_the_directory_its_manifest_lives_in(tpc):
+    """`pip install -r requirements.txt` from the root fails when the file is
+    in a subdirectory. The survey knows where each manifest lives, so a
+    non-root one is prefixed rather than left to fail on paste."""
+    survey = {"locks": ["requirements.txt"], "manifests": ["requirements.txt"],
+              "manifest_homes": {"requirements.txt": ["embedder"]},
+              "manager": None}
+    cmd = tpc.reinstall_command(survey, "/dest")
+    # Absolute, so chaining a second one does not resolve against the first.
+    assert "cd /dest/embedder && pip install -r requirements.txt" in cmd
+
+
+def test_a_root_manifest_is_not_prefixed(tpc):
+    survey = {"locks": ["requirements.txt"], "manifests": ["requirements.txt"],
+              "manifest_homes": {"requirements.txt": [""]}, "manager": None}
+    assert tpc.reinstall_command(survey, "/dest").endswith(
+        "pip install -r requirements.txt")
+
+
+def test_every_requirements_directory_is_named(tpc):
+    """A repo can hold several Python services, each with its own
+    requirements.txt. Naming one and silently dropping the rest is worse than
+    naming none, since the omission is invisible."""
+    survey = {"locks": ["requirements.txt"], "manifests": ["requirements.txt"],
+              "manifest_homes": {"requirements.txt": ["embedder", "whisperer"]},
+              "manager": None}
+    cmd = tpc.reinstall_command(survey, "/dest")
+    assert "embedder" in cmd and "whisperer" in cmd
+    # Each install runs from the destination root, not from the previous one.
+    assert cmd.count("pip install -r requirements.txt") == 2

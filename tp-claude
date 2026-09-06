@@ -1333,7 +1333,28 @@ def reinstall_command(survey: dict, dest_dir: str) -> str:
 
     if not parts:
         return ""
-    return f"cd {shlex.quote(dest_dir)} && " + " && ".join(parts)
+
+    # `pip install -r requirements.txt` names a file relative to the working
+    # directory, so it fails outright when the file lives in a subdirectory --
+    # and a repo can hold several Python services, each with its own. The
+    # survey knows where they all are, so name every one: listing a single
+    # directory and dropping the rest hides the omission.
+    #
+    # Each is written as an absolute `cd`, because chaining relative ones would
+    # resolve the second against the first.
+    homes = survey.get("manifest_homes") or {}
+    root = dest_dir.rstrip("/")
+    fixed = []
+    for part in parts:
+        if not part.startswith("pip install -r"):
+            fixed.append(part)
+            continue
+        where = homes.get("requirements.txt") or [""]
+        for home in where:
+            fixed.append(part if not home else
+                         f"cd {shlex.quote(f'{root}/{home}')} && {part}")
+
+    return f"cd {shlex.quote(dest_dir)} && " + " && ".join(fixed)
 
 
 def print_reinstall(reinstall: str) -> None:
