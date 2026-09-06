@@ -301,10 +301,34 @@ file.
 So entries are adopted only when the name itself says a tool produced them, and
 never when it could name a credential. That lets a project's own `.gitignore`
 contribute the build directories no generic rule knows about — a
-framework-specific `/public/build`, say — while `.env` still travels. Anything adopted this
-way is printed, so a skip is never silent. An ambiguous entry like
-`/public/css` is left alone: it is build output in one repo and hand-written in
-another, and under-skipping costs bandwidth while over-skipping costs source.
+framework-specific `/public/build`, say — while `.env` still travels. Anything
+adopted this way is printed, so a skip is never silent.
+
+Adoption is deliberately narrow, because a `.gitignore` entry carries no
+evidence that the directory is derived — only that it is untracked:
+
+- **Anchored and directory-only.** An adopted entry becomes `/entry/`, never a
+  bare `entry` that would also match at every depth and match *files*. A
+  hand-written `resources/vendor/`, and a file that merely shares a derived
+  name, both survive.
+- **Never a name the rules already gate.** `vendor`, `target`, `bin`, `out`,
+  `tmp`, `obj` and `bundle` are skipped *only* when a manifest proves them
+  derived, so they are never adopted from a `.gitignore` — that would route
+  around the gate. `bin` is the most common Go/Java `.gitignore` entry and also
+  the most common name for a directory of committed scripts.
+- **Never `logs`.** The Laravel rule is scoped to `/storage/logs/` rather than
+  `/storage/` for a reason; a bare `logs` would undo that at every depth, and
+  an application audit trail is a record of events, not rebuildable output.
+- **The whole name has to be conventional.** `build-cache` and `dist-prod` are
+  adopted; `my_build_notes` is not — one derived word inside a phrase is
+  somebody describing their own directory.
+- **Negations follow git.** `!dist` drops the `/dist` exclusion, while
+  `!dist/keep.js` does not: git cannot re-include a file underneath an excluded
+  directory, so that line is a no-op there and stays one here.
+
+An ambiguous entry like `/public/css` is left alone: it is build output in one
+repo and hand-written in another, and under-skipping costs bandwidth while
+over-skipping costs source.
 
 #### Before it skips, it checks
 
