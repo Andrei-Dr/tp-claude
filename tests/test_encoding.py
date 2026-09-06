@@ -10,7 +10,7 @@ these cases are checked against the algorithm lifted from the shipped binaries:
       return s.slice(0, MAX) + "-" + <hash>(p)
     }
 
-Reading releases 2.1.90 through 2.1.221, only <hash> ever changed, and only
+Reading releases 2.1.90 through 2.1.257, only <hash> ever changed, and only
 once: Bun.hash up to 2.1.100, and a plain 32-bit string hash from 2.1.101.
 Paths short enough to skip the suffix encode identically on every release.
 """
@@ -89,8 +89,8 @@ def test_short_paths_ignore_the_hash_entirely(tpc):
     assert tpc.encode_path("/Users/me/src/widget", explode) == "-Users-me-src-widget"
 
 
-def test_normalises_to_nfc_before_encoding(tpc):
-    """macOS hands back decomposed names; Claude normalises to NFC first.
+def test_normalizes_to_nfc_before_encoding(tpc):
+    """macOS hands back decomposed names; Claude normalizes to NFC first.
 
     Decomposed "é" is "e" + a combining accent, which would otherwise encode to
     "e-" while the composed form encodes to "-".

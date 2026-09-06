@@ -52,7 +52,7 @@ tp-claude ~/src/app ~/archive/
 | | Needed | Notes |
 |---|---|---|
 | Python | 3.9+ on both ends | verified on 3.11 – 3.14; the destination runs a small helper script |
-| rsync | either flavour | verified against macOS `openrsync` (protocol 29) **and** GNU rsync 3.x, in both directions |
+| rsync | either flavor | verified against macOS `openrsync` (protocol 29) **and** GNU rsync 3.x, in both directions |
 | ssh | key auth to any remote | password prompts are deliberately disabled |
 | `bun` | only for one edge case | see the release table below |
 
@@ -69,7 +69,7 @@ forever instead of appearing. Set up key auth first.
 
 `--info=`/`--progress2` are avoided because the openrsync that ships with macOS
 rejects them; `--protect-args` likewise doesn't exist there, so remote paths
-containing spaces inherit rsync's own quoting behaviour.
+containing spaces inherit rsync's own quoting behavior.
 
 ## What it actually does
 
@@ -104,7 +104,7 @@ function encode(p) {
 ```
 
 `/Users/me/src/app` therefore lives in `-Users-me-src-app`. Paths are
-NFC-normalised first, which matters on macOS: the filesystem returns decomposed
+NFC-normalized first, which matters on macOS: the filesystem returns decomposed
 names, so `é` arrives as `e` + a combining accent and would otherwise encode
 differently from the composed form.
 
@@ -122,13 +122,13 @@ overwrite the original sessions.
 ### Differences between Claude Code releases
 
 This layout is undocumented, so it was read out of the shipped binaries across
-releases 2.1.90 – 2.1.221. Almost all of it is stable:
+releases 2.1.90 – 2.1.257. Almost all of it is stable:
 
-| behaviour | across 2.1.90 … 2.1.221 |
+| behavior | across 2.1.90 … 2.1.257 |
 | --- | --- |
 | `[^a-zA-Z0-9]` becomes `-` | unchanged |
 | length limit before truncating | 200, unchanged |
-| NFC normalisation | unchanged |
+| NFC normalization | unchanged |
 | `CLAUDE_CONFIG_DIR ?? ~/.claude` | unchanged |
 | hash appended to over-long paths | **changed at 2.1.101** |
 
@@ -197,7 +197,7 @@ is everything it keeps, and where each piece ends up:
 | Trust decision, `allowedTools`, MCP servers, `ignorePatterns` | `~/.claude.json` → `projects[path]` | absolute path | ✅ |
 | Recalled prompts (up-arrow) | `<config>/history.jsonl` | absolute path per record | ✅ |
 | `/rewind` file snapshots | `<config>/file-history/<session>/` | `sha256(abs file path)[:16]` | ✅ re-keyed |
-| Project's own `.claude/` (settings, agents, commands) | inside the repo | — | ✅ via rsync |
+| Project's own `.claude/` (settings, agents, commands) | inside the repo | — | ✅ via rsync³ |
 | Per-run metrics (cost, tokens, durations) | `~/.claude.json` | absolute path | ❌ by choice¹ |
 | Global config (`CLAUDE.md`, `settings.json`, skills, plugins) | `<config>/` | not per-project | ❌ by design² |
 | Shell snapshots, paste cache, IDE locks | `<config>/` | machine/PID | ❌ machine-local |
@@ -206,7 +206,12 @@ is everything it keeps, and where each piece ends up:
 <sub>¹ They describe the machine that produced them, not the project.
 ² Deliberately untouched — these are *your machine's* configuration, not the
 project's, and overwriting them on the destination would be surprising. Sync
-them separately if you want them to match.</sub>
+them separately if you want them to match.
+³ Except `.claude/worktrees/` when `--no-worktrees` is passed.</sub>
+
+`--lean`, `--no-worktrees` and `--exclude` narrow the **code** sync only. The
+session directory is Claude's own data and is never filtered — a transcript
+that happens to sit under a directory named `dist/` is not build output.
 
 Two of these are worth explaining.
 
@@ -228,7 +233,7 @@ Merging into the two shared files is done carefully, since both are global:
   revoke permissions granted on the destination; appending would add a
   duplicate on every run.
 - **Nested objects merge key by key**, with the source winning ties.
-- **History is compared by content, not by its serialised text**, since key
+- **History is compared by content, not by its serialized text**, since key
   order and spacing differ between writers and matching raw text would append a
   fresh copy of every entry each time.
 - Both are rewritten atomically. A Claude Code running on the destination at
@@ -405,19 +410,23 @@ available, and skipped when not.
   destination that don't exist on the source, they are removed. It is off by
   default for exactly this reason.
 - **Remote destination paths containing spaces** hit rsync's own quoting
-  behaviour. `--protect-args` would fix it but is absent from the openrsync that
-  ships with macOS, so the behaviour is inherited rather than papered over.
+  behavior. `--protect-args` would fix it but is absent from the openrsync that
+  ships with macOS, so the behavior is inherited rather than papered over.
 - **`--lean` is opt-in.** Without it nothing is skipped, so an existing
   transfer never changes shape. Its rules are heuristics about someone else's
   project: they are conservative by design, and `--dry-run -v` shows exactly
   what a run would leave behind before you trust it.
 - **`--lean` does not run the reinstall for you.** The destination has the
   code and the lockfile but not the packages until you run the printed command.
+- **`--lean` with `--delete` does not prune what it skipped.** rsync protects
+  excluded paths from deletion, so a destination that already has its
+  `node_modules` keeps it rather than having it pruned as "missing from the
+  source".
 - Teleporting **does not remove anything from the source**; both machines end
   up holding the project and its history.
 - Session transcripts contain **everything you and Claude discussed**, including
   file contents and any secrets that passed through. Teleporting a project moves
   all of it. Treat the destination accordingly.
 - The session layout is **undocumented and version-specific**. It has held from
-  2.1.90 to 2.1.221, but Anthropic can change it; re-check the table above
+  2.1.90 to 2.1.257, but Anthropic can change it; re-check the table above
   against a new release before trusting it.

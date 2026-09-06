@@ -6,7 +6,7 @@ import pytest
 
 # --- endpoint parsing -------------------------------------------------------
 
-def test_recognises_a_remote_spec(tpc):
+def test_recognizes_a_remote_spec(tpc):
     end = tpc.Endpoint.parse("me@host:/home/me/src")
     assert (end.remote, end.ssh, end.path) == (True, "me@host", "/home/me/src")
 

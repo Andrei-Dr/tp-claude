@@ -82,7 +82,7 @@ def die(msg: str) -> "None":
 # returns decomposed names, so "é" arrives as "e" + a combining accent and would
 # otherwise encode to "e-" rather than "-".
 #
-# Reading 2.1.90 through 2.1.221 (see docs in README), everything about this is
+# Reading 2.1.90 through 2.1.257 (see docs in README), everything about this is
 # stable across releases -- the 200 limit, the character rule, NFC, and
 # resolving the config dir as CLAUDE_CONFIG_DIR ?? ~/.claude -- except <hash>,
 # which changed exactly once:
@@ -607,7 +607,7 @@ def merge(existing, incoming):
 
 
 def fingerprint(line):
-    '''Compare history entries by content, not by how they were serialised:
+    '''Compare history entries by content, not by how they were serialized:
     key order and spacing differ between writers, and matching on the raw text
     would append a fresh copy of every entry on each run.'''
     try:

@@ -160,7 +160,7 @@ def test_leaves_a_manifest_on_the_destination(world):
 
 
 def test_the_manifest_does_not_describe_the_source(world):
-    """It only has to recognise its own mapping, so it stores a digest rather
+    """It only has to recognize its own mapping, so it stores a digest rather
     than leaving the source machine's layout on the destination."""
     world.seed_session()
     world.run(world.src, f"{world.dest_parent}/")
