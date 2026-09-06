@@ -450,3 +450,31 @@ def test_every_requirements_directory_is_named(tpc):
     assert "embedder" in cmd and "whisperer" in cmd
     # Each install runs from the destination root, not from the previous one.
     assert cmd.count("pip install -r requirements.txt") == 2
+
+
+def test_the_printed_command_summarizes_many_excludes(tpc, capsys):
+    """A monorepo yields one anchored exclude per package, which is correct but
+    unreadable printed in full -- and it is the same list every run. Collapse
+    the display only; what rsync receives is unchanged."""
+    opts = ["-az", "--stats"] + [f"--exclude=/p{i}/dist/" for i in range(30)]
+    line = tpc.format_rsync_command(["rsync", *opts, "src/", "dst/"])
+    assert "30 excludes" in line
+    assert len(line) < 200
+    assert line.startswith("rsync -az --stats")
+
+
+def test_a_short_command_is_printed_in_full(tpc):
+    """Below the threshold nothing is hidden."""
+    cmd = ["rsync", "-az", "--stats", "--exclude=node_modules/", "s/", "d/"]
+    line = tpc.format_rsync_command(cmd)
+    assert "--exclude=node_modules/" in line
+    assert "excludes" not in line
+
+
+def test_verbose_prints_every_exclude(tpc):
+    """`-v` is what you reach for when asking why a file was skipped, so it
+    has to show the patterns rather than a count."""
+    opts = ["-az", "-v"] + [f"--exclude=/p{i}/dist/" for i in range(30)]
+    line = tpc.format_rsync_command(["rsync", *opts, "s/", "d/"])
+    assert "excludes]" not in line
+    assert "--exclude=/p29/dist/" in line

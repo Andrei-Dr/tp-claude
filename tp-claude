@@ -1368,9 +1368,30 @@ def print_reinstall(reinstall: str) -> None:
         print(f"\n   rebuild the skipped directories with:\n\n     {reinstall}")
 
 
+# Above this many excludes the command is summarized rather than printed in
+# full. A monorepo yields one anchored exclude per package -- correct, since an
+# unanchored `dist/` would also drop a hand-written docs/dist -- but a wall of
+# them buries the two arguments that actually differ between runs.
+EXCLUDE_DISPLAY_LIMIT = 6
+
+
+def format_rsync_command(cmd: list) -> str:
+    """The command as a readable line. Collapses a long exclude list; what
+    rsync is given is never changed."""
+    excludes = [c for c in cmd if c.startswith("--exclude=")]
+    # -v is what you reach for when asking why a file was skipped, so it shows
+    # the patterns themselves rather than a count.
+    if len(excludes) <= EXCLUDE_DISPLAY_LIMIT or "-v" in cmd:
+        return " ".join(shlex.quote(c) for c in cmd)
+    rest = [c for c in cmd if not c.startswith("--exclude=")]
+    shown = " ".join(shlex.quote(c) for c in rest[:-2])
+    return (f"{shown} [{len(excludes)} excludes] "
+            f"{' '.join(shlex.quote(c) for c in rest[-2:])}")
+
+
 def rsync(src_arg: str, dest_arg: str, opts: list[str]) -> None:
     cmd = ["rsync", *opts, src_arg, dest_arg]
-    print("   $", " ".join(shlex.quote(c) for c in cmd))
+    print("   $", format_rsync_command(cmd))
     subprocess.run(cmd, check=True)
 
 
