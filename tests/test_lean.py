@@ -535,3 +535,13 @@ def test_rails_rule_does_not_skip_all_of_tmp(tpc):
     are named."""
     pats = tpc.rule_patterns(tpc.lean_rules({"Gemfile", "config/application.rb"}))
     assert "/tmp/" not in pats
+
+
+def test_the_readme_rule_table_lists_every_rule(tpc, script_path):
+    """The table is what a user reads to know what --lean does, so a rule
+    added without a row is an undocumented skip."""
+    import pathlib, re
+    readme = (pathlib.Path(script_path).parent / "README.md").read_text()
+    table = re.findall(r"^\| `([a-z]+)` \| ", readme, re.M)
+    for rule in tpc.LEAN_RULES:
+        assert rule.name in table, rule.name

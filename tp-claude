@@ -1489,8 +1489,8 @@ def main() -> None:
                          "depth (repeatable)")
     ap.add_argument("--no-lean-rule", action="append", default=[],
                     metavar="NAME", dest="disabled_rules",
-                    help="turn off one --lean rule by name (node, php, go, "
-                         "rust, python, ruby, laravel, build, cache)")
+                    help="turn off one --lean rule by name ("
+                         + ", ".join(r.name for r in LEAN_RULES) + ")")
     args = ap.parse_args()
 
     known = {rule.name for rule in LEAN_RULES}

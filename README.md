@@ -41,7 +41,7 @@ tp-claude ~/src/app ~/archive/
 | `--lean` | skip dependency trees and build output a package manager can rebuild (aliases: `--no-vendors`, `--no-deps`) |
 | `--no-worktrees` | skip `.claude/worktrees` at any depth — agent git checkouts naming this machine's paths |
 | `--exclude=PATTERN` | one more rsync exclude; repeatable |
-| `--no-lean-rule=NAME` | turn off a single `--lean` rule (`node`, `php`, `go`, `rust`, `python`, `ruby`, `laravel`, `build`, `cache`) |
+| `--no-lean-rule=NAME` | turn off a single `--lean` rule, by a name from the table below |
 | `--dry-run` | report what would move; changes nothing |
 | `--delete` | mirror exactly, pruning destination files the source no longer has (off by default) |
 | `--full` | ignore the manifest and resend every session file |
@@ -315,12 +315,19 @@ each anchored pattern is emitted per project directory, so a monorepo's
 | `rust` | `Cargo.toml` | `/target/` |
 | `python` | `pyproject.toml`, `requirements.txt`, … | `.venv/`, `venv/`, `__pycache__/`, `*.pyc`, `.tox/`, `.mypy_cache/`, `.ruff_cache/` |
 | `ruby` | `Gemfile` | `.bundle/`, `/vendor/bundle/` |
+| `rails` | `config/application.rb` | `/tmp/cache/`, `/tmp/pids/`, `/tmp/sockets/`, `/log/` |
 | `laravel` | `artisan` | `/bootstrap/cache/`, `/storage/framework/`, `/storage/logs/` |
 | `build` | any manifest | `.turbo/`, `.next/`, `.nuxt/`, `.svelte-kit/`, `.parcel-cache/`, `/dist/`, `/build/`, `/out/` |
 | `cache` | — | `.cache/`, `.npm/`, `.pytest_cache/`, `coverage/`, `.gradle/`, `.DS_Store`, PHP tool caches |
 
 Drop a single rule with `--no-lean-rule=build`, or add your own patterns with
 `--exclude`.
+
+The two framework rules show where the line sits. Rails and Laravel both keep
+regenerable state next to irreplaceable state — `tmp/cache` beside `public/assets`,
+`storage/logs` beside `storage/app` — so each rule names the derived children
+and never the parent. `public/assets` in particular is compiled output under
+Rails and hand-written source elsewhere, so no rule touches it.
 
 #### What `.gitignore` contributes, and what it doesn't
 
