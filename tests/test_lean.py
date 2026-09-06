@@ -146,7 +146,7 @@ def test_clean_repo_reports_nothing(tmp_path, tpc):
 def test_adopts_a_derived_looking_entry(tpc):
     """A build directory this ruleset does not know about by name."""
     adopted, _ = tpc.gitignore_skips("/public/build\n", set())
-    assert "/public/build" in adopted
+    assert "/public/build/" in adopted
 
 
 def test_does_not_adopt_an_ambiguous_entry(tpc):
@@ -190,7 +190,7 @@ def test_negations_are_respected(tpc):
 
 def test_ignores_comments_and_blanks(tpc):
     adopted, _ = tpc.gitignore_skips("# a comment\n\n  \n/dist\n", set())
-    assert adopted == ["/dist"]
+    assert adopted == ["/dist/"]
 
 
 def test_reports_what_it_adopted(tpc):
@@ -207,17 +207,18 @@ def test_does_not_duplicate_what_rules_already_cover(tpc):
 
 def test_adopts_cache_and_log_directories(tpc):
     adopted, _ = tpc.gitignore_skips(
-        "/var/cache\n/tmp/build-artifacts\n*.log\n", set())
-    assert "/var/cache" in adopted
-    assert "/tmp/build-artifacts" in adopted
+        "/var/cache\n/srv/build\n*.log\n", set())
+    assert "/var/cache/" in adopted
+    assert "/srv/build/" in adopted
 
 
-def test_does_not_force_a_directory_slash_onto_a_file_entry(tpc):
-    """`foo/` matches only directories, so appending '/' to a file entry makes
-    the pattern silently miss. Real case: .phpunit.result.cache is a file."""
+def test_adopted_entries_never_match_files(tpc):
+    """Adopted patterns are directory-only, so a file that merely shares a
+    derived name survives. Cache FILES (.phpunit.result.cache) are covered by
+    the static cache rule, which names them explicitly; letting the .gitignore
+    path emit slashless patterns is what let a file named `bin` be dropped."""
     adopted, _ = tpc.gitignore_skips(".phpunit.result.cache\n", set())
-    assert ".phpunit.result.cache" in adopted
-    assert ".phpunit.result.cache/" not in adopted
+    assert ".phpunit.result.cache" not in adopted
 
 
 def test_an_entry_written_with_a_slash_keeps_it(tpc):
@@ -251,4 +252,54 @@ def test_still_adopts_conventional_compound_names(tpc):
     """Two-part names that are genuinely conventional stay adopted."""
     for entry in ("/build-cache", "/dist-prod", "/.turbo-cache"):
         adopted, _ = tpc.gitignore_skips(entry + "\n", set())
-        assert adopted == [entry], entry
+        assert adopted == [entry + "/"], entry
+
+
+def test_adopted_entries_are_anchored_and_directory_only(tpc):
+    """An adopted entry must not be looser than a rule would have been.
+
+    The ruleset's safety comes from patterns being anchored (so `/vendor/` is
+    the root one, not `resources/vendor/`) and directory-only (so a FILE named
+    `bin` survives). An entry adopted from a .gitignore has to carry both, or
+    it silently outreaches every rule in the table.
+    """
+    adopted, _ = tpc.gitignore_skips("/public/build\n", set())
+    assert adopted == ["/public/build/"]
+
+
+def test_does_not_adopt_a_bare_ecosystem_directory_name(tpc):
+    """`vendor`, `bin`, `target` name real hand-written directories.
+
+    The rules only skip these when a manifest proves them derived; adopting
+    them from a .gitignore would route around that gate entirely. `bin` is the
+    most common Go/Java .gitignore entry AND the most common name for a
+    directory of committed scripts.
+    """
+    for entry in ("bin", "vendor", "target", "out", "tmp", "obj", "bundle",
+                  "/bin", "vendor/", "/target/"):
+        adopted, _ = tpc.gitignore_skips(entry + "\n", set())
+        assert adopted == [], entry
+
+
+def test_does_not_adopt_bare_logs(tpc):
+    """Application audit logs are records of events, not rebuildable output.
+
+    The Laravel rule is deliberately scoped to /storage/logs/ rather than
+    /storage/; a bare `logs` entry would undo that scoping at every depth.
+    """
+    for entry in ("logs", "/logs", "log", "/app/logs"):
+        adopted, _ = tpc.gitignore_skips(entry + "\n", set())
+        assert adopted == [], entry
+
+
+def test_does_not_adopt_a_name_that_merely_mentions_a_derived_word(tpc):
+    """`my_build_notes` is somebody's notes, not build output.
+
+    A conventional derived name is the word itself (`dist`) or a compound of
+    derived words (`build-cache`). A word sitting among unrelated ones is
+    description, not a convention.
+    """
+    for entry in ("/my_build_notes", "/old-dist-experiments",
+                  "/cache-invalidation-docs", "/notes_on_build"):
+        adopted, _ = tpc.gitignore_skips(entry + "\n", set())
+        assert adopted == [], entry

@@ -983,10 +983,29 @@ def effective_landing(src: Endpoint, dest: Endpoint) -> tuple[str, str]:
 # so a skip is never silent.
 
 # Names that mean "produced by a tool" wherever they appear.
-DERIVED_WORDS = ("build", "dist", "cache", "caches", "tmp", "temp", "out",
-                 "output", "coverage", "generated", "artifacts", "logs",
-                 "node_modules", "vendor", "target", "bin", "obj", "min",
-                 "compiled", "bundle", "assets-build", "public-build")
+#
+# Deliberately excludes the ecosystem directory names the RULES cover --
+# vendor, target, bin, out, tmp, obj, bundle, logs. Those are only derived when
+# a manifest proves it (a `vendor/` beside a composer.json), and the rules
+# already skip them on exactly that evidence. Adopting them here from a
+# .gitignore would route around that gate: `bin` is the most common Go/Java
+# .gitignore entry and also the most common name for a directory of committed
+# scripts, and `logs` would undo the careful /storage/logs/ scoping that keeps
+# application audit trails -- records of events, not rebuildable output -- from
+# being dropped.
+DERIVED_WORDS = ("build", "dist", "cache", "caches", "coverage", "generated",
+                 "node_modules", "min", "compiled", "assets-build",
+                 "public-build",
+                 # Tool names that only ever label that tool's own output.
+                 "turbo", "webpack", "rollup", "vite", "parcel", "esbuild",
+                 "gradle", "maven", "nuxt", "next", "svelte-kit")
+
+# Qualifiers that conventionally attach to a derived word -- dist-prod,
+# build-dev, cache-v2. Allowed ALONGSIDE a derived word, never on their own: a
+# bare `/test` or `/local` is not build output.
+DERIVED_QUALIFIERS = ("prod", "production", "dev", "development", "staging",
+                      "test", "tests", "local", "tmp", "old", "new", "final",
+                      "v1", "v2", "v3", "1", "2", "3")
 
 # Anything that smells like a credential is never adopted, however derived the
 # rest of the name looks. Checked first and independently for that reason.
@@ -1022,9 +1041,16 @@ def _looks_derived(entry: str) -> bool:
     lowered = entry.lower().rstrip("/")
     tail = lowered.rsplit("/", 1)[-1]
     chunks = [c for c in re.split(r"[._\-]+", tail) if c]
-    if len(chunks) > 3:
+    if not chunks:
         return False
-    return any(chunk in DERIVED_WORDS for chunk in chunks)
+    # Every chunk has to be a derived word or a qualifier attached to one, and
+    # at least one has to be a derived word proper. `build-cache` and
+    # `dist-prod` qualify; `my_build_notes` is somebody describing their own
+    # directory, and a bare `/test` is not build output.
+    if not any(chunk in DERIVED_WORDS for chunk in chunks):
+        return False
+    return all(chunk in DERIVED_WORDS or chunk in DERIVED_QUALIFIERS
+               for chunk in chunks)
 
 
 def gitignore_skips(text: str, already: set) -> tuple[list, list]:
@@ -1052,13 +1078,15 @@ def gitignore_skips(text: str, already: set) -> tuple[list, list]:
         # feature is trying to avoid.
         if any(ch in entry for ch in "*?[]"):
             continue
-        # A trailing '/' in rsync means "directories only", so adding one to an
-        # entry that names a file makes the pattern silently miss it
-        # (.phpunit.result.cache is a file, not a directory). Only keep the
-        # slash the .gitignore itself wrote, which is where it means the same
-        # thing in both formats.
-        pattern = entry
-        if pattern in already or f"{pattern}/" in already or pattern in adopted:
+        # An adopted entry must never be looser than a rule would have been.
+        # The ruleset is safe because its patterns are ANCHORED (so `/vendor/`
+        # is the one at the root, not a `resources/vendor/` of source) and
+        # DIRECTORY-ONLY (so a file that merely shares the name survives). An
+        # entry taken from a .gitignore gets both, or it silently outreaches
+        # every rule in the table.
+        pattern = "/" + entry.strip("/") + "/"
+        if pattern in already or pattern.strip("/") in already \
+                or f"{pattern.strip('/')}/" in already or pattern in adopted:
             continue
         adopted.append(pattern)
         reasons.append(f"{entry}  (.gitignore)")
@@ -1331,7 +1359,9 @@ def main() -> None:
                          "this machine's paths")
     ap.add_argument("--exclude", action="append", default=[],
                     metavar="PATTERN",
-                    help="extra rsync exclude pattern (repeatable)")
+                    help="extra rsync exclude pattern, passed through "
+                         "verbatim — unanchored patterns match at every "
+                         "depth (repeatable)")
     ap.add_argument("--no-lean-rule", action="append", default=[],
                     metavar="NAME", dest="disabled_rules",
                     help="turn off one --lean rule by name (node, php, go, "
