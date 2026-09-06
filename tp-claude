@@ -5,7 +5,8 @@ to (or from) another machine (or another path on this one), so you can resume
 your conversations on the other side.
 
 Usage:
-    tp-claude <SRC> <DEST> [--dry-run] [--delete] [--full] [-v]
+    tp-claude <SRC> <DEST> [--lean] [--no-worktrees] [--exclude=PAT]
+                           [--dry-run] [--delete] [--full] [-v]
 
 SRC and DEST are handed to rsync VERBATIM — they mean exactly what they mean to
 rsync, including the trailing-slash rule:
@@ -34,6 +35,14 @@ How it works:
        rsync would resend and rewrite every session file on every run. A file
        is skipped only while both fingerprints still hold, which keeps edits on
        either side from being missed. --full ignores it; --delete implies it.
+
+--lean skips what a package manager can rebuild -- node_modules, vendor,
+target, .venv, .turbo, .next, dist -- which is usually most of a project by
+size and is often the wrong architecture for the destination anyway. The rules
+are gated on a manifest (a `vendor/` with no composer.json is somebody's source
+directory) and scoped by path (Laravel's storage/logs is derived; storage/app
+is user uploads). Before skipping anything it reports what a reinstall could
+NOT rebuild, and afterwards it prints the command that rebuilds the rest.
 
 Requires rsync + python3 on both ends, and ssh key auth to any remote side.
 """

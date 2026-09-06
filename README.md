@@ -16,7 +16,8 @@ tp-claude ~/src/app  me@server:/home/me/src/app
 ## Usage
 
 ```
-tp-claude <SRC> <DEST> [--dry-run] [--delete] [--full] [-v]
+tp-claude <SRC> <DEST> [--lean] [--no-worktrees] [--exclude=PATTERN]
+                       [--dry-run] [--delete] [--full] [-v]
 ```
 
 `SRC` and `DEST` go to rsync **verbatim** and mean exactly what they mean to
@@ -37,6 +38,10 @@ tp-claude ~/src/app ~/archive/
 
 | flag | effect |
 | --- | --- |
+| `--lean` | skip dependency trees and build output a package manager can rebuild (aliases: `--no-vendors`, `--no-deps`) |
+| `--no-worktrees` | skip `.claude/worktrees` — agent git checkouts naming this machine's paths |
+| `--exclude=PATTERN` | one more rsync exclude; repeatable |
+| `--no-lean-rule=NAME` | turn off a single `--lean` rule (`node`, `php`, `go`, `rust`, `python`, `ruby`, `laravel`, `build`, `cache`) |
 | `--dry-run` | report what would move; changes nothing |
 | `--delete` | mirror exactly, pruning destination files the source no longer has (off by default) |
 | `--full` | ignore the manifest and resend every session file |
@@ -68,7 +73,9 @@ containing spaces inherit rsync's own quoting behaviour.
 
 ## What it actually does
 
-1. **rsync `SRC` -> `DEST`**, untouched.
+0. **Optionally work out what to skip** (`--lean`), from the manifests the
+   project actually has — and report anything a reinstall could not rebuild.
+1. **rsync `SRC` -> `DEST`**, untouched (minus those excludes).
 2. **Work out where rsync put things**, by applying rsync's own trailing-slash
    rule. This is used only to locate the session directories.
 3. **rsync the session directory across** — transcripts, subagents, tool
@@ -227,6 +234,114 @@ Merging into the two shared files is done carefully, since both are global:
 - Both are rewritten atomically. A Claude Code running on the destination at
   that moment could still overwrite the change, so prefer an idle target.
 
+### Skipping what can be rebuilt
+
+`node_modules`, `vendor`, `target`, `.venv` and build output are usually most
+of a project by size, and they are the least worth moving: they are derived
+from files that *do* travel, and they are frequently the wrong architecture for
+the destination. A mac's `node_modules` carries `darwin-arm64` binaries that a
+Linux box cannot load, so copying them wastes the transfer and then breaks the
+build with a confusing error rather than an honest missing-dependency one.
+
+`--lean` skips them and prints the command that rebuilds them:
+
+```
+tp-claude --lean ~/dev/app  me@server:/home/me/dev/
+```
+
+Measured on two real projects:
+
+| project | default | `--lean` |
+| --- | --- | --- |
+| pnpm monorepo (Next.js, turbo) | 8.9 GB / 113,753 files | 197 MB / 5,969 files |
+| Laravel app (Composer + npm) | 2.8 GB / 139,098 files | 1.3 GB / 6,446 files |
+
+Two things keep this from destroying work.
+
+**Rules are gated on a manifest.** `vendor/` means "installed by Composer" next
+to a `composer.json` and "a directory somebody named vendor" otherwise;
+`target/` is Cargo's output only next to a `Cargo.toml`. Matching on the name
+alone would delete source.
+
+**Rules are scoped by path.** Laravel's `storage/` holds regenerable caches and
+logs next to `storage/app`, which is user uploads that no reinstall can bring
+back — so the patterns name `storage/logs` and `storage/framework`, never
+`storage` itself. Anchoring works the same way: `/vendor/` is the Composer one
+at the root, while a `resources/vendor/` of hand-written code is untouched.
+`node_modules` is deliberately *not* anchored, since workspaces nest one per
+package and all of them are derived.
+
+| rule | needs | skips |
+| --- | --- | --- |
+| `node` | — | `node_modules/` |
+| `php` | `composer.json` | `/vendor/` |
+| `go` | `go.mod` | `/vendor/` |
+| `rust` | `Cargo.toml` | `/target/` |
+| `python` | `pyproject.toml`, `requirements.txt`, … | `.venv/`, `venv/`, `__pycache__/`, `*.pyc`, `.tox/`, `.mypy_cache/`, `.ruff_cache/` |
+| `ruby` | `Gemfile` | `.bundle/`, `/vendor/bundle/` |
+| `laravel` | `artisan` | `/bootstrap/cache/`, `/storage/framework/`, `/storage/logs/` |
+| `build` | any manifest | `.turbo/`, `.next/`, `.nuxt/`, `.svelte-kit/`, `.parcel-cache/`, `/dist/`, `/build/`, `/out/` |
+| `cache` | — | `.cache/`, `.npm/`, `.pytest_cache/`, `coverage/`, `.gradle/`, `.DS_Store`, PHP tool caches |
+
+Drop a single rule with `--no-lean-rule=build`, or add your own patterns with
+`--exclude`.
+
+#### What `.gitignore` contributes, and what it doesn't
+
+A `.gitignore` looks like a ready-made list of things not worth sending, and it
+isn't: it answers *"should git track this?"*, whose answer covers three kinds of
+file.
+
+| in `.gitignore` | example | skipped |
+| --- | --- | :---: |
+| derived | `/public/build`, `.turbo/` | ✅ |
+| secrets | `.env`, `*.key`, `.mcp.json`, credentials | ❌ the destination cannot run without them |
+| local data | uploads, generated assets (one real repo ignores 196 MB of them) | ❌ nothing regenerates them |
+
+So entries are adopted only when the name itself says a tool produced them, and
+never when it could name a credential. That lets a project's own `.gitignore`
+contribute the build directories no generic rule knows about — `/public/build`
+in the Laravel app above — while `.env` still travels. Anything adopted this
+way is printed, so a skip is never silent. An ambiguous entry like
+`/public/css` is left alone: it is build output in one repo and hand-written in
+another, and under-skipping costs bandwidth while over-skipping costs source.
+
+#### Before it skips, it checks
+
+Skipping is only safe when a package manager can rebuild what was skipped, so
+`--lean` first reports what it could not:
+
+- a `file:`/`link:`/`portal:` dependency resolving **outside** the synced tree
+- `pnpm` `patchedDependencies`, whose patch files have to travel to match
+- a Composer `path` repository pointing outside the tree
+- a manifest with no lockfile above it — versions unpinned, so a reinstall may
+  not reproduce the same tree
+- a `.venv` with no `requirements.txt` or `pyproject.toml` declaring it
+
+These are heuristics about someone else's project, so they are reported and the
+transfer proceeds rather than being refused. A virtualenv is the weakest case
+for rebuilding and the strongest for not copying: it hard-codes the source
+machine's interpreter path, so it arrives broken either way.
+
+Afterwards the reinstall command is printed — detected from the lockfiles
+present, with `packageManager` breaking ties when a repo carries more than one:
+
+```
+>> done. resume with:  cd /home/me/dev/app && claude --resume
+
+   rebuild the skipped directories with:
+
+     cd /home/me/dev/app && pnpm install --frozen-lockfile
+```
+
+It is printed and never run. Reinstalling is a long, network-bound build that
+can fail on its own terms, and making it a side effect of a sync would leave a
+transfer that already succeeded looking like it failed.
+
+Excludes apply to the **code** sync only. The session directory is Claude's own
+data, and a transcript that happens to sit under a directory named `dist/` is
+not build output.
+
 ### The manifest
 
 Step 4 necessarily makes the destination copies differ from their sources, so
@@ -268,6 +383,12 @@ available, and skipped when not.
 - **Remote destination paths containing spaces** hit rsync's own quoting
   behaviour. `--protect-args` would fix it but is absent from the openrsync that
   ships with macOS, so the behaviour is inherited rather than papered over.
+- **`--lean` is opt-in.** Without it nothing is skipped, so an existing
+  transfer never changes shape. Its rules are heuristics about someone else's
+  project: they are conservative by design, and `--dry-run -v` shows exactly
+  what a run would leave behind before you trust it.
+- **`--lean` does not run the reinstall for you.** The destination has the
+  code and the lockfile but not the packages until you run the printed command.
 - Teleporting **does not remove anything from the source**; both machines end
   up holding the project and its history.
 - Session transcripts contain **everything you and Claude discussed**, including
