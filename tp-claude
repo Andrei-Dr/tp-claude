@@ -35,6 +35,12 @@ How it works:
        rsync would resend and rewrite every session file on every run. A file
        is skipped only while both fingerprints still hold, which keeps edits on
        either side from being missed. --full ignores it; --delete implies it.
+    6. Reconnect any git worktrees the code tree carries. git records absolute
+       paths for a repo's linked worktrees, which a teleport leaves naming the
+       source machine; the same path substitution as step 4 re-homes them and
+       `git worktree repair` finishes the relink, so they are usable on the
+       destination instead of showing up prunable. A no-op for a tree with no
+       worktrees or no git.
 
 --lean skips what a package manager can rebuild -- node_modules, vendor,
 target, .venv, .turbo, .next, dist -- which is usually most of a project by
@@ -1262,7 +1268,7 @@ def plan_skips(src: Endpoint, src_dir: str, dest_dir: str,
             skips += anchor(pattern)
 
         if patterns or extra:
-            print(">> [0/4] skipping rebuildable directories ...")
+            print(">> [0/5] skipping rebuildable directories ...")
             for rule in rules:
                 print(f"   {rule.name:<8} {rule.why}")
             for why in adopted_why:
@@ -1277,7 +1283,7 @@ def plan_skips(src: Endpoint, src_dir: str, dest_dir: str,
             reinstall = reinstall_command(survey, dest_dir)
             print()
         else:
-            print(">> [0/4] --lean: nothing here matches a skip rule")
+            print(">> [0/5] --lean: nothing here matches a skip rule")
             print()
 
     return [f"--exclude={pattern}" for pattern in skips], reinstall
@@ -1568,17 +1574,18 @@ def main() -> None:
     # this whole tool exists to carry.
     code_opts = rsync_opts + skip_opts
 
-    print(">> [1/4] syncing code ...")
+    print(">> [1/5] syncing code ...")
     rsync(src.arg, dest.arg, code_opts)
 
-    print(">> [2/4] syncing Claude session data ...")
+    print(">> [2/5] syncing Claude session data ...")
     if not src.dir_exists(src_proj):
         # Never opened in Claude Code here — nothing to carry over. Exit 0 so a
         # batch loop keeps going.
         print(f"   nothing at {src.loc(src_proj)} — code only, no sessions.")
         if not args.dry_run:
-            migrate_project_state(src, dest, src_dir, dest_dir,
-                                  build_subs(src, dest, src_dir, dest_dir))
+            subs = build_subs(src, dest, src_dir, dest_dir)
+            migrate_project_state(src, dest, src_dir, dest_dir, subs)
+            repair_worktrees(dest, dest_dir, subs)
         print(f"\n>> done (code only): {dest_dir}")
         print_reinstall(reinstall)
         return
@@ -1602,7 +1609,7 @@ def main() -> None:
     else:
         print(f"   all {len(todo.src_files)} file(s) already up to date")
 
-    print(">> [3/4] rewriting embedded paths ...")
+    print(">> [3/5] rewriting embedded paths ...")
     if not subs:
         print("   paths identical on both sides — nothing to rewrite")
     elif todo.files is not None and not todo.files:
@@ -1618,6 +1625,7 @@ def main() -> None:
     record_manifest(src, dest, src_proj, dest_proj, subs, src_dir, dest_dir)
     migrate_file_history(src, dest, src_dir, dest_dir, src_proj, rsync_opts)
     migrate_project_state(src, dest, src_dir, dest_dir, subs)
+    repair_worktrees(dest, dest_dir, subs)
     print(f"\n>> done. resume with:  cd {dest_dir} && claude --resume")
     print_reinstall(reinstall)
 
@@ -1765,7 +1773,7 @@ def migrate_project_state(src: Endpoint, dest: Endpoint, src_dir: str,
     destination as a project it has never seen: the trust dialog reappears and
     every previously granted tool permission is asked for again.
     """
-    print(">> [4/4] carrying over project settings ...")
+    print(">> [4/5] carrying over project settings ...")
     state = src.read_project_state(src_dir)
     settings = state.get("settings")
     history = state.get("history") or []
@@ -1788,6 +1796,28 @@ def migrate_project_state(src: Endpoint, dest: Endpoint, src_dir: str,
         parts.append(f"{written['history']} recalled prompt(s)")
     print(f"   carried over {' and '.join(parts)}" if parts
           else "   already up to date")
+
+
+def repair_worktrees(dest: Endpoint, dest_dir: str,
+                     subs: list[tuple[str, str]]) -> None:
+    """Reconnect the code tree's git worktrees on the destination.
+
+    A repo's linked worktrees record absolute paths that a teleport leaves
+    naming the source machine, so on the far side they read as prunable. This
+    rewrites those pointers to the new location and lets `git worktree repair`
+    finish the job -- the git equivalent of the path rewrite the session files
+    already get. It is a no-op for a tree with no worktrees or no git at all,
+    and it needs a path substitution to do anything, so a same-machine
+    relocation (where src and dest share a $HOME and the paths differ only in
+    the leaf, already covered by subs) still works while an identity move skips.
+    """
+    print(">> [5/5] reconnecting git worktrees ...")
+    if not subs:
+        print("   paths identical on both sides -- nothing to reconnect")
+        return
+    program = _worktree_repair_program(dest_dir, subs)
+    blob = base64.b64encode(program.encode()).decode()
+    dest.run(f"echo {shlex.quote(blob)} | base64 -d | python3 -")
 
 
 def _rewriter_program(proj_dir: str, subs: list[tuple[str, str]],
@@ -1857,6 +1887,100 @@ for path in targets():
     if path.endswith(EXTS) and rewrite(path):
         changed += 1
 print(f"   rewrote {{changed}} file(s)")
+"""
+
+
+def _worktree_repair_program(dest_dir: str, subs: list[tuple[str, str]]) -> str:
+    """A self-contained program that reconnects git worktrees on the machine
+    that now holds the teleported tree.
+
+    git records absolute paths for a repo's linked worktrees in two files per
+    worktree -- .git/worktrees/<name>/gitdir and the worktree's own .git file --
+    and a teleport moves the files without touching those paths, so on the
+    destination they name the source machine and the worktrees read as prunable.
+
+    Two passes, in this order:
+      1. Rewrite the source-machine paths in both pointer files to the
+         destination, using the same boundary-aware substitutions the session
+         rewriter applies. This is what actually heals the common case.
+      2. Run `git worktree repair` from the main checkout. It is the
+         belt-and-suspenders: it re-cross-links any pointer the substitutions
+         could not (a worktree that genuinely moved relative to the repo), and
+         it is a harmless no-op once pass 1 has made every path valid.
+
+    The order matters. `git worktree repair` locates a worktree *through* the
+    path in its gitdir file; run first, while that path still names a
+    nonexistent source location, it finds nothing and cannot repair anything.
+    Rewriting first makes the paths locally valid so repair has something real
+    to work with. A worktree whose directory did not travel (it lived outside
+    the transferred tree) leaves a dangling gitdir pointer with nothing behind
+    it; both passes step over it without error and git prunes it later.
+    """
+    return f"""\
+import os, re, subprocess
+DEST_DIR = {dest_dir!r}
+SUBS = {subs!r}
+TMP_SUFFIX = ".tp-tmp"
+
+# Match each path only at a component boundary, exactly as the session rewriter
+# does, so rewriting "…/repo" cannot maul a sibling "…/repo2".
+RULES = [(re.compile(re.escape(old) + r"(?![A-Za-z0-9._-])"), new)
+         for old, new in SUBS]
+
+
+def rewrite(path):
+    \"\"\"Rewrite the paths in one pointer file, atomically. Returns True if it
+    changed. A file that is absent or unreadable is simply skipped.\"\"\"
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            text = fh.read()
+    except (UnicodeDecodeError, OSError):
+        return False
+    out = text
+    for pattern, new in RULES:
+        out = pattern.sub(lambda _m, n=new: n, out)
+    if out == text:
+        return False
+    tmp = path + TMP_SUFFIX
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(out)
+    os.replace(tmp, path)          # never a half-written pointer file
+    return True
+
+
+worktrees = os.path.join(DEST_DIR, ".git", "worktrees")
+changed = 0
+if os.path.isdir(worktrees):
+    for name in os.listdir(worktrees):
+        gitdir_file = os.path.join(worktrees, name, "gitdir")
+        if rewrite(gitdir_file):
+            changed += 1
+        # The gitdir file names the worktree's .git file; its back-pointer
+        # needs the same rewrite, but only if the worktree directory travelled.
+        try:
+            with open(gitdir_file, encoding="utf-8") as fh:
+                backref = fh.read().strip()
+        except OSError:
+            backref = ""
+        if backref and os.path.isfile(backref) and rewrite(backref):
+            changed += 1
+
+    # Pass 2: let git re-cross-link anything the substitution could not, and
+    # canonicalize the rest. Harmless when pass 1 already fixed everything, and
+    # skipped without complaint if git is not on this machine's PATH -- pass 1
+    # has already healed the common case, so a missing git is not fatal.
+    try:
+        result = subprocess.run(["git", "-C", DEST_DIR, "worktree", "repair"],
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True)
+        repaired = result.stdout.strip()
+    except OSError:
+        repaired = ""
+    if repaired:
+        for line in repaired.splitlines():
+            print("   " + line)
+
+print(f"   repaired {{changed}} worktree pointer(s)")
 """
 
 

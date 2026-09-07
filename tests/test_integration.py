@@ -830,3 +830,57 @@ def test_lean_on_a_rails_app(world):
     assert (world.landed / "vendor" / "mygem" / "lib.rb").exists()
     assert (world.landed / "public" / "assets" / "app-abc.js").exists()
     assert "bundle install" in out
+
+
+# --- git worktrees survive the hop -------------------------------------------
+
+def _git(cwd, *args):
+    return subprocess.run(["git", *args], cwd=str(cwd), text=True,
+                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+
+
+def _make_repo_with_worktree(root):
+    """A git repo at `root` with one linked worktree inside it, named the way
+    the agent worktrees that prompted this feature are: .claude/worktrees/*."""
+    _git(root, "init", "-q")
+    _git(root, "config", "user.email", "t@t")
+    _git(root, "config", "user.name", "t")
+    (root / "main.py").write_text("print('hi')\n")
+    _git(root, "add", "main.py")
+    _git(root, "commit", "-qm", "init")
+    wt = root / ".claude" / "worktrees" / "agent-1"
+    _git(root, "worktree", "add", "-q", str(wt))
+    return wt
+
+
+@pytest.mark.skipif(not shutil.which("git"), reason="git not installed")
+def test_a_git_worktree_is_reconnected_at_the_destination(world):
+    """A repo carrying a linked worktree lands with that worktree's git
+    metadata still naming the source path; the teleport re-homes it so it is
+    usable on the destination rather than showing up prunable."""
+    _make_repo_with_worktree(world.src)
+    world.seed_session()
+    world.run(world.src, f"{world.dest_parent}/")
+    landed_wt = world.landed / ".claude" / "worktrees" / "agent-1"
+    listing = _git(world.landed, "worktree", "list").stdout
+    # The landed worktree is healthy: named in the listing, not prunable, and
+    # git commands work from inside it.
+    assert str(landed_wt) in listing.replace("/private", "")\
+        or str(landed_wt) in listing
+    assert "prunable" not in listing
+    assert _git(landed_wt, "status").returncode == 0
+    # And its pointer files no longer name the source tree.
+    gitdir = (world.landed / ".git" / "worktrees" / "agent-1" / "gitdir")
+    assert str(world.src) not in gitdir.read_text()
+
+
+@pytest.mark.skipif(not shutil.which("git"), reason="git not installed")
+def test_the_worktree_step_runs_even_without_sessions(world):
+    """The code-only path (no Claude data for this project) still repairs
+    worktrees -- a repo can have them whether or not it was ever opened here."""
+    landed_wt = world.landed / ".claude" / "worktrees" / "agent-1"
+    _make_repo_with_worktree(world.src)
+    out = world.run(world.src, f"{world.dest_parent}/").stdout
+    assert "code only" in out
+    assert "reconnecting git worktrees" in out
+    assert _git(landed_wt, "status").returncode == 0
