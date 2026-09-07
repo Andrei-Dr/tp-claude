@@ -359,6 +359,53 @@ def test_manifest_search_never_descends_into_a_dependency_tree(tpc, tmp_path):
     assert "node_modules" not in found[0] and "vendor" not in found[0]
 
 
+def test_the_survey_program_is_self_contained(tpc, tmp_path):
+    """The remote survey ships as source lifted out of this file and run in a
+    fresh interpreter, so every module global it touches has to be listed in
+    SURVEY_SOURCES. A global referenced by local_survey but left off that list
+    -- PATH_MARKERS was -- imports fine here yet dies with NameError the moment
+    it runs standalone, which is exactly the path no in-process test exercises.
+
+    Executing the assembled program in an empty namespace against a real tree
+    reproduces that ship path, so the omission fails a test instead of a run.
+    """
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "application.rb").write_text("module App; end\n")
+    (tmp_path / "Gemfile").write_text('source "x"\n')
+    program = tpc.SURVEY_PROGRAM % {"root": repr(str(tmp_path))}
+    namespace = {}
+    out = __import__("io").StringIO()
+    import contextlib
+    with contextlib.redirect_stdout(out):
+        exec(compile(program, "<survey>", "exec"), namespace)
+    payload = out.getvalue()
+    assert payload.startswith("tp<") and payload.rstrip().endswith(">tp")
+    survey = __import__("json").loads(payload.strip()[3:-3])
+    # The Rails path marker made it through the standalone run.
+    assert "config/application.rb" in survey["manifests"]
+
+
+def test_survey_sources_carry_every_global_the_helpers_reference(tpc):
+    """A structural guard for the same class of bug, done at true module scope:
+    load the assembled program as a module and byte-compile it. Any name a
+    survey helper reads that SURVEY_SOURCES forgot to ship is a NameError the
+    moment that line runs -- so compile it, then exec it and read back the one
+    global that names should resolve against. This is broader than the Rails
+    fixture: it runs local_survey against this very repo, whose tree reaches
+    the manifest/lock/gitignore branches the empty fixture never does."""
+    import contextlib
+    import io
+    import pathlib
+    root = str(pathlib.Path(tpc.__file__).resolve().parent)
+    program = tpc.SURVEY_PROGRAM % {"root": repr(root)}
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        exec(compile(program, "<survey>", "exec"), {})
+    payload = out.getvalue().strip()
+    assert payload.startswith("tp<") and payload.endswith(">tp")
+    __import__("json").loads(payload[3:-3])  # well-formed, no missing globals
+
+
 def test_requirements_txt_gets_a_reinstall_command(tpc):
     """A plain pip project has its .venv skipped, so it needs the command that
     rebuilds it. requirements.txt was a detection manifest with no entry in the

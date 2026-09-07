@@ -1172,7 +1172,7 @@ def local_survey(root: str) -> dict:
 # the logic in a string -- which would drift from the real one the moment
 # either changed -- the helpers are lifted out of this file's own source and
 # shipped verbatim, so both ends always run identical code.
-SURVEY_SOURCES = ("MANIFEST_FILES", "LOCKFILES", "_find_manifests",
+SURVEY_SOURCES = ("MANIFEST_FILES", "PATH_MARKERS", "LOCKFILES", "_find_manifests",
                   "_json_or_none", "_lock_above", "_local_dep_warnings",
                   "reconstructability", "local_survey")
 
