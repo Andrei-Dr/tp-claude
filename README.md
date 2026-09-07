@@ -86,6 +86,11 @@ containing spaces inherit rsync's own quoting behavior.
    `/rewind` snapshots — so the destination doesn't treat it as a project it
    has never seen.
 6. **Leave a manifest** so the next run can skip what has not changed.
+7. **Reconnect any git worktrees** the code carries. git stores absolute paths
+   for a repo's linked worktrees, which a teleport leaves pointing at the source
+   machine; the same rewrite as step 4 re-homes them and `git worktree repair`
+   finishes the relink, so they land usable rather than prunable. A no-op for a
+   tree with no worktrees or no git.
 
 ### Where Claude Code keeps sessions
 
