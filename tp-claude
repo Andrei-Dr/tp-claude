@@ -1285,6 +1285,13 @@ def plan_skips(src: Endpoint, src_dir: str, dest_dir: str,
         else:
             print(">> [0/5] --lean: nothing here matches a skip rule")
             print()
+    else:
+        # A full transfer copies node_modules/vendor/etc verbatim, but those
+        # are host-specific -- a mac's darwin-arm64 binaries will not load on a
+        # linux box, and even a same-arch copy is a stale, unmanaged tree the
+        # destination should re-derive from the lockfile. So still work out the
+        # install command; the summary prints it either way.
+        reinstall = reinstall_command(src.survey(src_dir), dest_dir)
 
     return [f"--exclude={pattern}" for pattern in skips], reinstall
 
@@ -1391,15 +1398,21 @@ def reinstall_command(survey: dict, dest_dir: str) -> str:
     return f"cd {shlex.quote(dest_dir)} && " + " && ".join(fixed)
 
 
-def print_reinstall(reinstall: str) -> None:
-    """Suggest how to rebuild what --lean skipped.
+def print_reinstall(reinstall: str, lean: bool = False) -> None:
+    """Suggest how to (re)install dependencies on the destination.
 
     Printed, never run: reinstalling is a long, network-bound build that can
     fail on its own terms, and making it a side effect of a sync would leave a
     transfer that already succeeded looking like it failed.
+
+    Under --lean the dependency directories were skipped, so this rebuilds
+    them. On a full transfer they were copied verbatim -- host-specific and
+    stale -- so the same command re-derives them from the lockfile instead.
     """
     if reinstall:
-        print(f"\n   rebuild the skipped directories with:\n\n     {reinstall}")
+        why = ("rebuild the skipped directories with" if lean else
+               "the copied dependencies are host-specific; install with")
+        print(f"\n   {why}:\n\n     {reinstall}")
 
 
 # Above this many excludes the command is summarized rather than printed in
@@ -1587,7 +1600,7 @@ def main() -> None:
             migrate_project_state(src, dest, src_dir, dest_dir, subs)
             repair_worktrees(dest, dest_dir, subs)
         print(f"\n>> done (code only): {dest_dir}")
-        print_reinstall(reinstall)
+        print_reinstall(reinstall, args.lean)
         return
 
     subs = build_subs(src, dest, src_dir, dest_dir)
@@ -1627,7 +1640,7 @@ def main() -> None:
     migrate_project_state(src, dest, src_dir, dest_dir, subs)
     repair_worktrees(dest, dest_dir, subs)
     print(f"\n>> done. resume with:  cd {dest_dir} && claude --resume")
-    print_reinstall(reinstall)
+    print_reinstall(reinstall, args.lean)
 
 
 @dataclass

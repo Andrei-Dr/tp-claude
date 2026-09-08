@@ -585,6 +585,25 @@ def test_lean_reports_the_reinstall_command(node_world):
     assert str(node_world.landed) in out
 
 
+def test_full_transfer_still_reports_the_install_command(node_world):
+    """A non-lean transfer copies node_modules verbatim -- but a mac's
+    darwin-arm64 binaries cannot load on a linux box, so the destination has
+    to reinstall anyway. The summary must say how, even though nothing was
+    skipped; the lockfile alone is enough to know the command."""
+    out = node_world.run(node_world.src,
+                         f"{node_world.dest_parent}/").stdout
+    assert "pnpm install" in out
+    assert str(node_world.landed) in out
+
+
+def test_full_transfer_without_a_manifest_advises_nothing(world):
+    """No manifest, no lockfile -- there is nothing to install, so the
+    summary stays quiet rather than inventing a command."""
+    (world.src / "notes.txt").write_text("just files\n")
+    out = world.run(world.src, f"{world.dest_parent}/").stdout
+    assert "install" not in out.lower()
+
+
 def test_no_vendors_is_an_alias_for_lean(node_world):
     node_world.run("--no-vendors", node_world.src,
                    f"{node_world.dest_parent}/")

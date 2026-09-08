@@ -423,6 +423,13 @@ A manifest that brought no lockfile still gets the install it implies — a bare
 preflight says so, but skipping a dependency tree and then printing no way to
 rebuild it would be worse.
 
+The command is printed on a **full** transfer too, not only under `--lean`. A
+copied `node_modules` is host-specific — a mac's `darwin-arm64` binaries will
+not load on a linux box, and even a same-arch copy is a stale, unmanaged tree —
+so the destination should re-derive it from the lockfile regardless. Only the
+wording differs (`the copied dependencies are host-specific; install with:`);
+when there is no manifest at all, nothing is printed.
+
 It is printed and never run. Reinstalling is a long, network-bound build that
 can fail on its own terms, and making it a side effect of a sync would leave a
 transfer that already succeeded looking like it failed.
