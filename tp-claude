@@ -71,8 +71,43 @@ from collections import namedtuple
 from dataclasses import dataclass, field
 
 
+# Minimal color: four roles, nothing decorative. Disabled unless stdout is a
+# real terminal, so a redirected log or a pipe into grep stays plain text, and
+# honoring NO_COLOR (https://no-color.org) because a tool that ignores it is a
+# tool people have to work around.
+def _color_enabled() -> bool:
+    if os.environ.get("NO_COLOR"):
+        return False
+    if os.environ.get("TERM") == "dumb":
+        return False
+    return sys.stdout.isatty()
+
+
+COLOR = _color_enabled()
+
+
+def _paint(code: str):
+    """A function per role rather than raw escapes at the call sites, so the
+    decision to color is made once and the prints stay readable."""
+    def apply(text: str) -> str:
+        return f"\033[{code}m{text}\033[0m" if COLOR else text
+    return apply
+
+
+bold = _paint("1")        # phase headers: >> [n/5] ...
+warn = _paint("33")       # recoverable trouble: !! ...
+bad = _paint("31")        # fatal: die()
+good = _paint("32")       # the final done line
+dim = _paint("2")         # paths and commands echoed back
+
+
 def die(msg: str) -> "None":
-    print(f"tp-claude: {msg}", file=sys.stderr)
+    # stderr, so its own tty decides -- stdout may be a pipe while the terminal
+    # still shows this.
+    prefix = f"\033[31mtp-claude:\033[0m" if (
+        not os.environ.get("NO_COLOR") and sys.stderr.isatty()
+    ) else "tp-claude:"
+    print(f"{prefix} {msg}", file=sys.stderr)
     sys.exit(1)
 
 
@@ -1304,7 +1339,7 @@ def plan_skips(src: Endpoint, src_dir: str, dest_dir: str,
             skips += anchor(pattern)
 
         if patterns or extra:
-            print(">> [0/5] skipping rebuildable directories ...")
+            print(bold(">> [0/5] skipping rebuildable directories ..."))
             for rule in rules:
                 print(f"   {rule.name:<8} {rule.why}")
             for why in adopted_why:
@@ -1313,13 +1348,13 @@ def plan_skips(src: Endpoint, src_dir: str, dest_dir: str,
             if warnings:
                 print()
                 for warning in warnings:
-                    print(f"   !! {warning}")
+                    print(warn(f"   !! {warning}"))
                 print(f"\n   proceeding; {len(warnings)} item(s) may not "
                       f"survive a reinstall")
             reinstall = reinstall_command(survey, dest_dir)
             print()
         else:
-            print(">> [0/5] --lean: nothing here matches a skip rule")
+            print(bold(">> [0/5] --lean: nothing here matches a skip rule"))
             print()
     else:
         # A full transfer copies node_modules/vendor/etc verbatim, but those
@@ -1474,7 +1509,7 @@ def format_rsync_command(cmd: list) -> str:
 
 def rsync(src_arg: str, dest_arg: str, opts: list[str]) -> None:
     cmd = ["rsync", *opts, src_arg, dest_arg]
-    print("   $", format_rsync_command(cmd))
+    print(dim("   $ " + format_rsync_command(cmd)))
     subprocess.run(cmd, check=True)
 
 
@@ -1572,7 +1607,7 @@ def main() -> None:
     # else. That keeps a sloppy `ls | xargs tp-claude` from erroring on the
     # loose files that happen to sit alongside the project dirs.
     if not src.dir_exists(src.path.rstrip("/") or "/"):
-        print(f">> skip: {src.arg} is not a directory")
+        print(warn(f">> skip: {src.arg} is not a directory"))
         return
 
     src_dir, dest_dir = effective_landing(src, dest)
@@ -1626,7 +1661,7 @@ def main() -> None:
 
     skip_opts, reinstall = plan_skips(src, src_dir, dest_dir, args)
 
-    print(">> tp-claude" + ("  (dry run)" if args.dry_run else ""))
+    print(bold(">> tp-claude" + ("  (dry run)" if args.dry_run else "")))
     print(f"   code : {src.arg}  ->  {dest.arg}")
     print(f"   data : {src.loc(src_proj)}  ->  {dest.loc(dest_proj)}")
     print()
@@ -1637,10 +1672,10 @@ def main() -> None:
     # this whole tool exists to carry.
     code_opts = rsync_opts + code_delete + skip_opts
 
-    print(">> [1/5] syncing code ...")
+    print(bold(">> [1/5] syncing code ..."))
     rsync(src.arg, dest.arg, code_opts)
 
-    print(">> [2/5] syncing Claude session data ...")
+    print(bold(">> [2/5] syncing Claude session data ..."))
     if not src.dir_exists(src_proj):
         # Never opened in Claude Code here — nothing to carry over. Exit 0 so a
         # batch loop keeps going.
@@ -1649,7 +1684,7 @@ def main() -> None:
             subs = build_subs(src, dest, src_dir, dest_dir)
             migrate_project_state(src, dest, src_dir, dest_dir, subs)
             repair_worktrees(dest, dest_dir, subs)
-        print(f"\n>> done (code only): {dest_dir}")
+        print(good(f"\n>> done (code only): {dest_dir}"))
         print_reinstall(reinstall, args.lean)
         return
 
@@ -1658,7 +1693,7 @@ def main() -> None:
     if args.dry_run:
         rsync(f"{src.loc(src_proj)}/", f"{dest.loc(dest_proj)}/",
               rsync_opts + session_delete)
-        print("\n>> dry run: no path rewrite performed.")
+        print(bold("\n>> dry run: no path rewrite performed."))
         return
 
     dest.run(f"mkdir -p {shlex.quote(dest_proj)}")
@@ -1675,7 +1710,7 @@ def main() -> None:
     else:
         print(f"   all {len(todo.src_files)} file(s) already up to date")
 
-    print(">> [3/5] rewriting embedded paths ...")
+    print(bold(">> [3/5] rewriting embedded paths ..."))
     if not subs:
         print("   paths identical on both sides — nothing to rewrite")
     elif todo.files is not None and not todo.files:
@@ -1692,7 +1727,7 @@ def main() -> None:
     migrate_file_history(src, dest, src_dir, dest_dir, src_proj, rsync_opts)
     migrate_project_state(src, dest, src_dir, dest_dir, subs)
     repair_worktrees(dest, dest_dir, subs)
-    print(f"\n>> done. resume with:  cd {dest_dir} && claude --resume")
+    print(good(f"\n>> done. resume with:  cd {dest_dir} && claude --resume"))
     print_reinstall(reinstall, args.lean)
 
 
@@ -1839,7 +1874,7 @@ def migrate_project_state(src: Endpoint, dest: Endpoint, src_dir: str,
     destination as a project it has never seen: the trust dialog reappears and
     every previously granted tool permission is asked for again.
     """
-    print(">> [4/5] carrying over project settings ...")
+    print(bold(">> [4/5] carrying over project settings ..."))
     state = src.read_project_state(src_dir)
     settings = state.get("settings")
     history = state.get("history") or []
@@ -1847,9 +1882,9 @@ def migrate_project_state(src: Endpoint, dest: Endpoint, src_dir: str,
         # Loud, because the symptom on the far side (trust dialog returns,
         # permissions asked for again) points at the teleport rather than at
         # the config that actually caused it.
-        print(f"   !! {src.loc(src.settings_file)} could not be parsed "
-              f"({state['settings_unreadable']}) — settings not carried over; "
-              f"the source file was NOT modified")
+        print(warn(f"   !! {src.loc(src.settings_file)} could not be parsed "
+                   f"({state['settings_unreadable']}) — settings not carried "
+                   f"over; the source file was NOT modified"))
     if not settings and not history:
         print("   nothing recorded for this project")
         return
@@ -1863,9 +1898,10 @@ def migrate_project_state(src: Endpoint, dest: Endpoint, src_dir: str,
 
     written = dest.write_project_state(dest_dir, payload)
     if written.get("settings_unreadable"):
-        print(f"   !! {dest.loc(dest.settings_file)} could not be parsed "
-              f"({written['settings_unreadable']}) — left untouched rather than "
-              f"overwritten; it holds every other project's settings too")
+        print(warn(f"   !! {dest.loc(dest.settings_file)} could not be parsed "
+                   f"({written['settings_unreadable']}) — left untouched rather "
+                   f"than overwritten; it holds every other project's settings "
+                   f"too"))
     parts = []
     if written.get("settings"):
         parts.append("settings")
@@ -1888,7 +1924,7 @@ def repair_worktrees(dest: Endpoint, dest_dir: str,
     relocation (where src and dest share a $HOME and the paths differ only in
     the leaf, already covered by subs) still works while an identity move skips.
     """
-    print(">> [5/5] reconnecting git worktrees ...")
+    print(bold(">> [5/5] reconnecting git worktrees ..."))
     if not subs:
         print("   paths identical on both sides -- nothing to reconnect")
         return
