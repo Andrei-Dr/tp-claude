@@ -50,13 +50,14 @@ def world(tmp_path, script_path):
             (d / "memory" / "MEMORY.md").write_text(f"see {self.src}/main.py\n")
             return d
 
-        def run(self, *args, expect_ok=True):
+        def run(self, *args, expect_ok=True, env=None):
             result = subprocess.run(
                 [str(script_path), *[str(a) for a in args]],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                 env={**os.environ,
                      "HOME": str(self.home),
-                     "CLAUDE_CONFIG_DIR": str(self.config)})
+                     "CLAUDE_CONFIG_DIR": str(self.config),
+                     **(env or {})})
             if expect_ok:
                 assert result.returncode == 0, result.stdout
             return result
@@ -973,3 +974,58 @@ def test_delete_sessions_keeps_rewind_snapshots(world):
     (orphan / "abcdef0123456789@v1").write_text("dest only\n")
     world.run("--delete-sessions", world.src, f"{world.dest_parent}/")
     assert (orphan / "abcdef0123456789@v1").exists()
+
+
+# --- a malformed ~/.claude.json must never be clobbered ---------------------
+
+def test_malformed_dest_settings_is_not_clobbered(world):
+    """A corrupt destination ~/.claude.json is left exactly as found.
+
+    It is the only copy of every OTHER project's trust decision, allowedTools
+    and MCP config. Parsing it as {} and writing that back would discard all of
+    them to carry one project's settings across.
+    """
+    world.seed_session()
+    world.seed_settings()
+    dest_home = world.home / "desthome"
+    dest_home.mkdir()
+    corrupt = '{"projects": {"/x": {"allowedTools": ["Bash(ls:*)"]}'   # truncated
+    (dest_home / ".claude.json").write_text(corrupt)
+    result = world.run(world.src, f"{world.dest_parent}/",
+                       env={"HOME": str(dest_home)})
+    assert (dest_home / ".claude.json").read_text() == corrupt, \
+        "a malformed destination config was overwritten"
+    assert "could not be parsed" in result.stdout
+
+
+def test_malformed_source_settings_is_reported_not_silently_skipped(world):
+    """A corrupt SOURCE config must not read as 'this project has no settings'.
+
+    Silently carrying nothing across looks identical to a project that was
+    never opened, so the user learns about it only when the trust dialog
+    reappears on the far side.
+    """
+    world.seed_session()
+    world.settings_file.write_text('{"projects": {"/x": ')       # truncated
+    result = world.run(world.src, f"{world.dest_parent}/")
+    assert "could not be parsed" in result.stdout
+
+
+def test_malformed_source_settings_leaves_the_source_untouched(world):
+    """Reading the source must never write to it."""
+    world.seed_session()
+    corrupt = '{"projects": {"/x": '
+    world.settings_file.write_text(corrupt)
+    world.run(world.src, f"{world.dest_parent}/")
+    assert world.settings_file.read_text() == corrupt
+
+
+def test_sessions_still_transfer_when_settings_are_malformed(world):
+    """A broken config must not abort the teleport: the transcripts are the
+    point, and they are unaffected by whatever is wrong with the JSON."""
+    world.seed_session()
+    world.settings_file.write_text('{"projects": ')
+    world.run(world.src, f"{world.dest_parent}/")
+    landed = world.project_dir(world.landed) / "session.jsonl"
+    assert landed.exists()
+    assert str(world.landed) in landed.read_text()

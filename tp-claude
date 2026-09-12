@@ -574,12 +574,20 @@ print("tp<" + json.dumps({"moved": moved}) + ">tp")
 
 READ_STATE = """
 import json
-out = {"settings": None, "history": []}
+out = {"settings": None, "history": [], "settings_unreadable": None}
 try:
     with open(%(settings)s, encoding="utf-8") as fh:
-        out["settings"] = (json.load(fh).get("projects") or {}).get(%(key)s)
-except Exception:
-    pass
+        raw = fh.read()
+except OSError:
+    raw = None                # never opened here: nothing to carry, not an error
+if raw is not None:
+    try:
+        out["settings"] = (json.loads(raw).get("projects") or {}).get(%(key)s)
+    except Exception as exc:
+        # Unparseable is NOT the same as absent. Reporting it as "no settings"
+        # would look exactly like a project that was never opened, and the user
+        # would find out only when the trust dialog reappears on the far side.
+        out["settings_unreadable"] = str(exc)
 try:
     with open(%(history)s, encoding="utf-8", errors="replace") as fh:
         for line in fh:
@@ -633,12 +641,30 @@ def fingerprint(line):
     except Exception:
         return line
 
-if payload.get("settings"):
+def load_destination_settings():
+    '''The existing config, or None if it must not be touched.
+
+    An unparseable destination config is the only copy of every OTHER
+    project's trust decision, allowedTools and MCP servers. Treating it as {}
+    and writing that back would discard all of them to carry one project's
+    settings across, so the merge is skipped and reported instead.
+    '''
     try:
         with open(%(settings)s, encoding="utf-8") as fh:
             data = json.load(fh)
-    except Exception:
-        data = {}
+    except FileNotFoundError:
+        return {}                 # no config yet: creating one is safe
+    except Exception as exc:
+        result["settings_unreadable"] = str(exc)
+        return None
+    if not isinstance(data, dict):
+        result["settings_unreadable"] = "top level is not a JSON object"
+        return None
+    return data
+
+
+data = load_destination_settings() if payload.get("settings") else None
+if data is not None:
     projects = data.setdefault("projects", {})
     existing = projects.setdefault(%(key)s, {})
     for field, value in payload["settings"].items():
@@ -1808,6 +1834,13 @@ def migrate_project_state(src: Endpoint, dest: Endpoint, src_dir: str,
     state = src.read_project_state(src_dir)
     settings = state.get("settings")
     history = state.get("history") or []
+    if state.get("settings_unreadable"):
+        # Loud, because the symptom on the far side (trust dialog returns,
+        # permissions asked for again) points at the teleport rather than at
+        # the config that actually caused it.
+        print(f"   !! {src.loc(src.settings_file)} could not be parsed "
+              f"({state['settings_unreadable']}) — settings not carried over; "
+              f"the source file was NOT modified")
     if not settings and not history:
         print("   nothing recorded for this project")
         return
@@ -1820,6 +1853,10 @@ def migrate_project_state(src: Endpoint, dest: Endpoint, src_dir: str,
     }), subs))
 
     written = dest.write_project_state(dest_dir, payload)
+    if written.get("settings_unreadable"):
+        print(f"   !! {dest.loc(dest.settings_file)} could not be parsed "
+              f"({written['settings_unreadable']}) — left untouched rather than "
+              f"overwritten; it holds every other project's settings too")
     parts = []
     if written.get("settings"):
         parts.append("settings")
