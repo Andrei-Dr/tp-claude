@@ -1,0 +1,26 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  pytest:
+    # Both sides of a real teleport: macOS ships openrsync (protocol 29),
+    # Ubuntu ships GNU rsync 3.x, and the script has to satisfy both.
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ['3.9', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: rsync version under test
+        run: rsync --version | head -1
+      - run: pip install pytest
+      - run: pytest -q

@@ -59,10 +59,14 @@ tp-claude ~/src/app ~/archive/
 
 | Platform | Status |
 |---|:---:|
-| macOS → Linux, Linux → macOS | ✅ verified end to end |
+| macOS → Linux, Linux → macOS | ✅ in regular real-world use |
 | macOS ↔ macOS, Linux ↔ Linux | ✅ |
-| local → local (relocating a project) | ✅ |
+| local → local (relocating a project) | ✅ covered by the test suite |
 | Windows | ❌ needs a POSIX shell — WSL should work, untested |
+
+CI runs the suite on macOS and Ubuntu (openrsync and GNU rsync) against Python
+3.9 and 3.13, plus one real teleport over ssh to localhost. The cross-machine
+rows above rest on day-to-day use rather than on automation.
 
 Password prompts are disabled on purpose (`BatchMode=yes`): the helper scripts
 occupy ssh's stdin, so a prompt would have nowhere to render and would hang

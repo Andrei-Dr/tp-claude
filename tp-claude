@@ -869,6 +869,15 @@ print("tp<" + resolved + ">tp")
         default, and it costs one stat per file rather than reading hundreds of
         megabytes to hash them. Optionally returns the manifest in the same
         round trip, so inspecting the destination costs one connection.
+
+        The theoretical hole in size+mtime is an edit that changes neither: it
+        needs the same byte count written inside one mtime tick. Transcripts
+        are append-only JSONL, so a same-size rewrite essentially does not
+        arise, and mtime_ns is genuinely nanosecond-resolution on APFS and
+        ext4 (the filesystems this runs on) rather than the 1s or 2s of FAT.
+        A skip also requires the DESTINATION fingerprint to still match what we
+        wrote, so a file edited on both ends is caught regardless. --full is
+        the escape hatch if a tree is ever suspected of it.
         """
         program = f'''
 import os, json
