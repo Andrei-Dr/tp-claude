@@ -903,3 +903,73 @@ def test_the_worktree_step_runs_even_without_sessions(world):
     assert "code only" in out
     assert "reconnecting git worktrees" in out
     assert _git(landed_wt, "status").returncode == 0
+
+
+def test_delete_does_not_prune_destination_only_sessions(world):
+    """--delete mirrors the CODE tree; it must not touch the session directory.
+
+    The premise of the tool is that transcripts are precious and unfilterable
+    -- a repo is reconstructible from git, a conversation is not. Working the
+    same project on two machines and teleporting back is the whole point, and
+    the sessions started on the destination exist nowhere else.
+    """
+    world.seed_session()
+    world.run(world.src, f"{world.dest_parent}/")
+    landed_proj = world.project_dir(world.landed)
+    # A conversation that only ever happened on the destination machine.
+    (landed_proj / "other.jsonl").write_text(
+        json.dumps({"cwd": str(world.landed)}) + "\n")
+    world.run("--delete", world.src, f"{world.dest_parent}/")
+    assert (landed_proj / "other.jsonl").exists(), \
+        "--delete pruned a session that only existed on the destination"
+
+
+def test_delete_sessions_prunes_destination_only_sessions(world):
+    """The opt-in flag for when you DO want the session directory mirrored."""
+    world.seed_session()
+    world.run(world.src, f"{world.dest_parent}/")
+    landed_proj = world.project_dir(world.landed)
+    (landed_proj / "other.jsonl").write_text(
+        json.dumps({"cwd": str(world.landed)}) + "\n")
+    world.run("--delete-sessions", world.src, f"{world.dest_parent}/")
+    assert not (landed_proj / "other.jsonl").exists()
+    assert (landed_proj / "session.jsonl").exists()
+
+
+def test_delete_sessions_leaves_the_code_tree_additive(world):
+    """--delete-sessions is not --delete: the code side stays additive."""
+    world.seed_session()
+    world.run(world.src, f"{world.dest_parent}/")
+    (world.landed / "only-here.txt").write_text("kept\n")
+    world.run("--delete-sessions", world.src, f"{world.dest_parent}/")
+    assert (world.landed / "only-here.txt").exists()
+
+
+def test_delete_and_delete_sessions_together_mirror_both_sides(world):
+    """The flags are independent; passing both mirrors code and sessions."""
+    world.seed_session()
+    world.run(world.src, f"{world.dest_parent}/")
+    landed_proj = world.project_dir(world.landed)
+    (landed_proj / "other.jsonl").write_text(
+        json.dumps({"cwd": str(world.landed)}) + "\n")
+    (world.landed / "only-here.txt").write_text("pruned\n")
+    world.run("--delete", "--delete-sessions", world.src,
+              f"{world.dest_parent}/")
+    assert not (landed_proj / "other.jsonl").exists()
+    assert not (world.landed / "only-here.txt").exists()
+    assert (landed_proj / "session.jsonl").exists()
+    assert (world.landed / "main.py").exists()
+
+
+def test_delete_sessions_keeps_rewind_snapshots(world):
+    """Snapshots follow sessions and are keyed by session id, so pruning them
+    against a source that never had that session would discard the rewind
+    history of a destination-only conversation."""
+    world.seed_session()
+    session = world.seed_file_history()
+    world.run(world.src, f"{world.dest_parent}/")
+    orphan = world.config / "file-history" / "dest-only-session"
+    orphan.mkdir(parents=True, exist_ok=True)
+    (orphan / "abcdef0123456789@v1").write_text("dest only\n")
+    world.run("--delete-sessions", world.src, f"{world.dest_parent}/")
+    assert (orphan / "abcdef0123456789@v1").exists()

@@ -34,7 +34,8 @@ How it works:
        produced. Step 4 necessarily makes the two sides differ, so without this
        rsync would resend and rewrite every session file on every run. A file
        is skipped only while both fingerprints still hold, which keeps edits on
-       either side from being missed. --full ignores it; --delete implies it.
+       either side from being missed. --full ignores it, as does
+       --delete-sessions (which mirrors the directory outright).
     6. Reconnect any git worktrees the code tree carries. git records absolute
        paths for a repo's linked worktrees, which a teleport leaves naming the
        source machine; the same path substitution as step 4 re-homes them and
@@ -1485,8 +1486,13 @@ def main() -> None:
     ap.add_argument("--dry-run", action="store_true",
                     help="show what would transfer; changes nothing")
     ap.add_argument("--delete", action="store_true",
-                    help="mirror exactly, pruning files on the destination "
-                         "that no longer exist on the source (off by default)")
+                    help="mirror the CODE tree exactly, pruning files on the "
+                         "destination that no longer exist on the source; "
+                         "never touches sessions (off by default)")
+    ap.add_argument("--delete-sessions", action="store_true",
+                    help="also mirror the session directory, pruning "
+                         "conversations the source does not have — this "
+                         "discards sessions started on the destination")
     ap.add_argument("-v", "--verbose", action="store_true",
                     help="list every transferred file (off by default)")
     ap.add_argument("--full", action="store_true",
@@ -1564,15 +1570,24 @@ def main() -> None:
     rsync_opts = ["-az", "--stats"]
     if args.verbose:
         rsync_opts.append("-v")
-    if args.delete:
-        # --force lets rsync clear a non-empty directory when the source now
-        # has a symlink (or file) in its place; without it rsync refuses and
-        # silently leaves the stale directory behind. It only fires on that
-        # replace-with-non-directory conflict, so it rides with --delete rather
-        # than being a standalone footgun.
-        rsync_opts += ["--delete", "--force"]
     if args.dry_run:
         rsync_opts.append("-n")
+
+    # --force lets rsync clear a non-empty directory when the source now has a
+    # symlink (or file) in its place; without it rsync refuses and silently
+    # leaves the stale directory behind. It only fires on that
+    # replace-with-non-directory conflict, so it rides with --delete rather
+    # than being a standalone footgun.
+    #
+    # Pruning is deliberately per-side. A repo is reconstructible from git; a
+    # conversation is not, and working the same project from two machines
+    # leaves each end holding sessions the other has never seen -- so mirroring
+    # the code must not quietly take them with it. --delete-sessions is the
+    # separate, louder opt-in for when the session directory really is meant
+    # to match.
+    delete_opts = ["--delete", "--force"]
+    code_delete = delete_opts if args.delete else []
+    session_delete = delete_opts if args.delete_sessions else []
 
     skip_opts, reinstall = plan_skips(src, src_dir, dest_dir, args)
 
@@ -1585,7 +1600,7 @@ def main() -> None:
     # own data -- a transcript that happens to sit under a directory named
     # dist/ is not build output, and dropping it would lose the conversation
     # this whole tool exists to carry.
-    code_opts = rsync_opts + skip_opts
+    code_opts = rsync_opts + code_delete + skip_opts
 
     print(">> [1/5] syncing code ...")
     rsync(src.arg, dest.arg, code_opts)
@@ -1606,19 +1621,22 @@ def main() -> None:
     subs = build_subs(src, dest, src_dir, dest_dir)
 
     if args.dry_run:
-        rsync(f"{src.loc(src_proj)}/", f"{dest.loc(dest_proj)}/", rsync_opts)
+        rsync(f"{src.loc(src_proj)}/", f"{dest.loc(dest_proj)}/",
+              rsync_opts + session_delete)
         print("\n>> dry run: no path rewrite performed.")
         return
 
     dest.run(f"mkdir -p {shlex.quote(dest_proj)}")
     todo = plan_transfer(src, dest, src_proj, dest_proj, subs,
-                         src_dir, dest_dir, full=args.full or args.delete)
+                         src_dir, dest_dir,
+                         full=args.full or args.delete_sessions)
 
+    session_opts = rsync_opts + session_delete
     if todo.files is None:                       # no usable manifest: sync all
-        rsync(f"{src.loc(src_proj)}/", f"{dest.loc(dest_proj)}/", rsync_opts)
+        rsync(f"{src.loc(src_proj)}/", f"{dest.loc(dest_proj)}/", session_opts)
     elif todo.files:
         print(f"   {len(todo.files)} of {len(todo.src_files)} file(s) changed")
-        rsync_files(src, dest, src_proj, dest_proj, todo.files, rsync_opts)
+        rsync_files(src, dest, src_proj, dest_proj, todo.files, session_opts)
     else:
         print(f"   all {len(todo.src_files)} file(s) already up to date")
 
