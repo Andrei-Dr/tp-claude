@@ -43,7 +43,8 @@ tp-claude ~/src/app ~/archive/
 | `--exclude=PATTERN` | one more rsync exclude; repeatable |
 | `--no-lean-rule=NAME` | turn off a single `--lean` rule, by a name from the table below |
 | `--dry-run` | report what would move; changes nothing |
-| `--delete` | mirror exactly, pruning destination files the source no longer has (off by default) |
+| `--delete` | mirror the **code** exactly, pruning destination files the source no longer has; sessions are never pruned (off by default) |
+| `--delete-sessions` | also mirror the **session** directory — discards conversations started on the destination |
 | `--full` | ignore the manifest and resend every session file |
 | `-v` | list every transferred file |
 
@@ -214,9 +215,17 @@ project's, and overwriting them on the destination would be surprising. Sync
 them separately if you want them to match.
 ³ Except `.claude/worktrees/` when `--no-worktrees` is passed.</sub>
 
-`--lean`, `--no-worktrees` and `--exclude` narrow the **code** sync only. The
-session directory is Claude's own data and is never filtered — a transcript
-that happens to sit under a directory named `dist/` is not build output.
+`--lean`, `--no-worktrees`, `--exclude` and `--delete` narrow or mirror the
+**code** sync only. The session directory is Claude's own data and is never
+filtered — a transcript that happens to sit under a directory named `dist/` is
+not build output.
+
+Pruning is per-side for the same reason. A repo is reconstructible from git; a
+conversation is not, and working one project from two machines leaves each end
+holding sessions the other has never seen — so `--delete` mirroring the code
+must not quietly take them with it. `--delete-sessions` is the separate opt-in
+for when the session directory really is meant to match, and it discards
+whatever the source does not have.
 
 Two of these are worth explaining.
 
