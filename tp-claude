@@ -822,6 +822,10 @@ class Endpoint:
     def dir_exists(self, path: str) -> bool:
         """True if `path` is a directory on this side. Never raises."""
         script = f"test -d {shlex.quote(path)}"
+        # Not a login shell, unlike run()/capture(): `test` is a bash builtin,
+        # so nothing here depends on the PATH a login profile sets up, and
+        # skipping the profile saves a round trip's worth of shell startup on
+        # a remote that sources a heavy .bash_profile.
         cmd = self._ssh_cmd("bash", "-s") if self.remote else ["bash", "-s"]
         return subprocess.run(cmd, input=script, text=True).returncode == 0
 
@@ -1700,28 +1704,9 @@ def main() -> None:
     todo = plan_transfer(src, dest, src_proj, dest_proj, subs,
                          src_dir, dest_dir,
                          full=args.full or args.delete_sessions)
-
-    session_opts = rsync_opts + session_delete
-    if todo.files is None:                       # no usable manifest: sync all
-        rsync(f"{src.loc(src_proj)}/", f"{dest.loc(dest_proj)}/", session_opts)
-    elif todo.files:
-        print(f"   {len(todo.files)} of {len(todo.src_files)} file(s) changed")
-        rsync_files(src, dest, src_proj, dest_proj, todo.files, session_opts)
-    else:
-        print(f"   all {len(todo.src_files)} file(s) already up to date")
-
-    print(bold(">> [3/5] rewriting embedded paths ..."))
-    if not subs:
-        print("   paths identical on both sides — nothing to rewrite")
-    elif todo.files is not None and not todo.files:
-        print("   nothing transferred — nothing to rewrite")
-    else:
-        program = _rewriter_program(dest_proj, subs, todo.files)
-        blob = base64.b64encode(program.encode()).decode()
-        # Ship the program base64-encoded rather than as a heredoc: the bash
-        # script itself already occupies ssh's stdin, and a nested heredoc
-        # would fight it for the same stream.
-        dest.run(f"echo {shlex.quote(blob)} | base64 -d | python3 -")
+    send_sessions(src, dest, src_proj, dest_proj, todo,
+                  rsync_opts + session_delete)
+    rewrite_sessions(dest, dest_proj, subs, todo)
 
     record_manifest(src, dest, src_proj, dest_proj, subs, src_dir, dest_dir)
     migrate_file_history(src, dest, src_dir, dest_dir, src_proj, rsync_opts)
@@ -1729,6 +1714,41 @@ def main() -> None:
     repair_worktrees(dest, dest_dir, subs)
     print(good(f"\n>> done. resume with:  cd {dest_dir} && claude --resume"))
     print_reinstall(reinstall, args.lean)
+
+
+def send_sessions(src: Endpoint, dest: Endpoint, src_proj: str,
+                  dest_proj: str, todo: "Transfer", opts: list) -> None:
+    """Carry the session files the plan selected."""
+    if todo.files is None:                       # no usable manifest: sync all
+        rsync(f"{src.loc(src_proj)}/", f"{dest.loc(dest_proj)}/", opts)
+    elif todo.files:
+        print(f"   {len(todo.files)} of {len(todo.src_files)} file(s) changed")
+        rsync_files(src, dest, src_proj, dest_proj, todo.files, opts)
+    else:
+        print(f"   all {len(todo.src_files)} file(s) already up to date")
+
+
+def rewrite_sessions(dest: Endpoint, dest_proj: str, subs: list,
+                     todo: "Transfer") -> None:
+    """Re-point the absolute paths inside whatever just landed.
+
+    Skipped in the two cases where it would be a no-op: an identical path on
+    both sides leaves nothing to substitute, and a transfer that sent no files
+    leaves nothing that has not already been rewritten by an earlier run.
+    """
+    print(bold(">> [3/5] rewriting embedded paths ..."))
+    if not subs:
+        print("   paths identical on both sides — nothing to rewrite")
+        return
+    if todo.files is not None and not todo.files:
+        print("   nothing transferred — nothing to rewrite")
+        return
+    program = _rewriter_program(dest_proj, subs, todo.files)
+    blob = base64.b64encode(program.encode()).decode()
+    # Ship the program base64-encoded rather than as a heredoc: the bash script
+    # itself already occupies ssh's stdin, and a nested heredoc would fight it
+    # for the same stream.
+    dest.run(f"echo {shlex.quote(blob)} | base64 -d | python3 -")
 
 
 @dataclass
